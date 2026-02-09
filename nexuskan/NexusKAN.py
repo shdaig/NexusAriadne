@@ -5,8 +5,34 @@ import numpy as np
 
 import random
 
+from .NexusKANLayer import NexusKANLayer
+
 class NexusKAN(nn.Module):
-    def __init__(self, width=None, grid=3, k=3, mult_arity = 2, noise_scale=0.3, scale_base_mu=0.0, scale_base_sigma=1.0, base_fun='silu', symbolic_enabled=True, affine_trainable=False, grid_eps=0.02, grid_range=[-1, 1], sp_trainable=True, sb_trainable=True, seed=1, save_act=True, sparse_init=False, auto_save=True, first_init=True, ckpt_path='./model', state_id=0, round=0, device='cpu'):
+    def __init__(self, 
+                 width=None, 
+                 grid=3, 
+                 k=3, 
+                #  mult_arity = 2, 
+                 noise_scale=0.3, 
+                 scale_base_mu=0.0, 
+                 scale_base_sigma=1.0, 
+                 base_fun='silu', 
+                 symbolic_enabled=True, 
+                 affine_trainable=False, 
+                 grid_eps=0.02, 
+                 grid_range=[-1, 1],
+                 sp_trainable=True, 
+                 sb_trainable=True, 
+                 seed=1, 
+                 save_act=True, 
+                 sparse_init=False, 
+                #  auto_save=True, 
+                 first_init=True, 
+                 ckpt_path='./model', 
+                 state_id=0, 
+                 round=0, 
+                 device='cpu'):
+        
         super(NexusKAN, self).__init__()
 
         torch.manual_seed(seed)
@@ -15,27 +41,23 @@ class NexusKAN(nn.Module):
 
         ### initializeing the numerical front ###
 
-        self.act_fun = []
+        # self.act_fun = []
         self.depth = len(width) - 1
         
-        #print('haha1', width)
         for i in range(len(width)):
-            #print(type(width[i]), type(width[i]) == int)
             if type(width[i]) == int or type(width[i]) == np.int64:
                 width[i] = [width[i],0]
                 
-        #print('haha2', width)
-            
         self.width = width
         
         # if mult_arity is just a scalar, we extend it to a list of lists
         # e.g, mult_arity = [[2,3],[4]] means that in the first hidden layer, 2 mult ops have arity 2 and 3, respectively;
         # in the second hidden layer, 1 mult op has arity 4.
-        if isinstance(mult_arity, int):
-            self.mult_homo = True # when homo is True, parallelization is possible
-        else:
-            self.mult_homo = False # when home if False, for loop is required. 
-        self.mult_arity = mult_arity
+        # if isinstance(mult_arity, int):
+            # self.mult_homo = True # when homo is True, parallelization is possible
+        # else:
+            # self.mult_homo = False # when home if False, for loop is required. 
+        # self.mult_arity = mult_arity
 
         width_in = self.width_in
         width_out = self.width_out
@@ -63,16 +85,28 @@ class NexusKAN(nn.Module):
             else:
                 k_l = k
             
-            sp_batch = KANLayer(in_dim=width_in[l], out_dim=width_out[l+1], num=grid_l, k=k_l, noise_scale=noise_scale, scale_base_mu=scale_base_mu, scale_base_sigma=scale_base_sigma, scale_sp=1., base_fun=base_fun, grid_eps=grid_eps, grid_range=grid_range, sp_trainable=sp_trainable, sb_trainable=sb_trainable, sparse_init=sparse_init)
+            sp_batch = NexusKANLayer(in_dim=width_in[l], 
+                                     out_dim=width_out[l+1], 
+                                     num=grid_l, 
+                                     k=k_l, 
+                                     noise_scale=noise_scale, 
+                                     scale_base_mu=scale_base_mu, 
+                                     scale_base_sigma=scale_base_sigma, 
+                                     scale_sp=1., 
+                                     base_fun=base_fun, 
+                                     grid_eps=grid_eps, 
+                                     grid_range=grid_range, 
+                                     sp_trainable=sp_trainable, 
+                                     sb_trainable=sb_trainable, 
+                                     sparse_init=sparse_init)
             self.act_fun.append(sp_batch)
-
+        
+        self.affine_trainable = affine_trainable
+        
         self.node_bias = []
         self.node_scale = []
         self.subnode_bias = []
         self.subnode_scale = []
-        
-        globals()['self.node_bias_0'] = torch.nn.Parameter(torch.zeros(3,1)).requires_grad_(False)
-        exec('self.node_bias_0' + " = torch.nn.Parameter(torch.zeros(3,1)).requires_grad_(False)")
         
         for l in range(self.depth):
             exec(f'self.node_bias_{l} = torch.nn.Parameter(torch.zeros(width_in[l+1])).requires_grad_(affine_trainable)')
@@ -89,50 +123,12 @@ class NexusKAN(nn.Module):
         self.grid = grid
         self.k = k
         self.base_fun = base_fun
-
-        ### initializing the symbolic front ###
-        self.symbolic_fun = []
-        for l in range(self.depth):
-            sb_batch = Symbolic_KANLayer(in_dim=width_in[l], out_dim=width_out[l+1])
-            self.symbolic_fun.append(sb_batch)
-
-        self.symbolic_fun = nn.ModuleList(self.symbolic_fun)
-        self.symbolic_enabled = symbolic_enabled
-        self.affine_trainable = affine_trainable
-        self.sp_trainable = sp_trainable
-        self.sb_trainable = sb_trainable
-        
-        self.save_act = save_act
-            
-        self.node_scores = None
-        self.edge_scores = None
-        self.subnode_scores = None
-        
-        self.cache_data = None
-        self.acts = None
-        
-        self.auto_save = auto_save
-        self.state_id = 0
-        self.ckpt_path = ckpt_path
-        self.round = round
         
         self.device = device
         self.to(device)
         
-        if auto_save:
-            if first_init:
-                if not os.path.exists(ckpt_path):
-                    # Create the directory
-                    os.makedirs(ckpt_path)
-                print(f"checkpoint directory created: {ckpt_path}")
-                print('saving model version 0.0')
+        
+        
+        
 
-                history_path = self.ckpt_path+'/history.txt'
-                with open(history_path, 'w') as file:
-                    file.write(f'### Round {self.round} ###' + '\n')
-                    file.write('init => 0.0' + '\n')
-                self.saveckpt(path=self.ckpt_path+'/'+'0.0')
-            else:
-                self.state_id = state_id
-            
-        self.input_id = torch.arange(self.width_in[0],)
+        
