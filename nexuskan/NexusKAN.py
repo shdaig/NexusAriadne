@@ -127,8 +127,148 @@ class NexusKAN(nn.Module):
         self.device = device
         self.to(device)
         
+        self.input_id = torch.arange(self.width_in[0],)
+    
+    def to(self, device):
+        super(NexusKAN, self).to(device)
+        self.device = device
+        for kanlayer in self.act_fun:
+            kanlayer.to(device)
+        return self
+    
+    @property
+    def width_in(self):
+        '''
+        The number of input nodes for each layer
+        '''
+        width = self.width
+        width_in = [width[l][0] + width[l][1] for l in range(len(width))]
+        return width_in
+    
+    @property
+    def width_out(self):
+        '''
+        The number of output subnodes for each layer
+        '''
+        # ---------------------------------------------------------------------------------------------------------------------------------
+        width = self.width
+        if self.mult_homo == True:
+            width_out = [width[l][0]+self.mult_arity*width[l][1] for l in range(len(width))]
+        else:
+            width_out = [width[l][0] + int(np.sum(self.mult_arity[l])) for l in range(len(width))]
+        return width_out
+    
+    @property
+    def n_sum(self):
+        '''
+        The number of addition nodes for each layer
+        '''
+        width = self.width
+        n_sum = [width[l][0] for l in range(1, len(width)-1)]
+        return n_sum
+    
+    @property
+    def n_mult(self):
+        # ---------------------------------------------------------------------------------------------------------------------------------
+        '''
+        The number of multiplication nodes for each layer
+        '''
+        width = self.width
+        n_mult = [width[l][1] for l in range(1, len(width)-1)]
+        return n_mult
+    
+    def update_grid_from_samples(self, x):
+        '''
+        update grid from samples
         
-        
-        
+        Args:
+        -----
+            x : 2D torch.tensor
+                inputs
 
+        Returns:
+        --------
+            None
+            
+        Example
+        -------
+        >>> from kan import *
+        >>> model = KAN(width=[1,1], grid=5, k=3, seed=0)
+        >>> print(model.act_fun[0].grid)
+        >>> x = torch.linspace(-10,10,steps=101)[:,None]
+        >>> model.update_grid_from_samples(x)
+        >>> print(model.act_fun[0].grid)
+        ''' 
+        for l in range(self.depth):
+            self.get_act(x)
+            self.act_fun[l].update_grid_from_samples(self.acts[l])
+    
+    def update_grid(self, x):
+        '''
+        call update_grid_from_samples. This seems unnecessary but we retain it for the sake of classes that might inherit from MultKAN
+        '''
+        self.update_grid_from_samples(x)
         
+    def forward(self, x, singularity_avoiding=False, y_th=10.):
+       
+        x = x[:,self.input_id.long()]
+        assert x.shape[1] == self.width_in[0]
+        
+        self.acts = []  # shape ([batch, n0], [batch, n1], ..., [batch, n_L])
+        
+        self.acts_premult = []
+        self.spline_preacts = []
+        self.spline_postsplines = []
+        self.spline_postacts = []
+        self.acts_scale = []
+        self.acts_scale_spline = []
+        self.subnode_actscale = []
+        self.edge_actscale = []
+
+        self.acts.append(x)  # acts shape: (batch, width[l])
+
+        for l in range(self.depth):
+            
+            x_numerical, preacts, postacts_numerical, postspline = self.act_fun[l](x)
+            
+            x = x_numerical
+            
+            # subnode affine transform
+            x = self.subnode_scale[l][None,:] * x + self.subnode_bias[l][None,:]
+            
+            # multiplication
+            dim_sum = self.width[l+1][0]
+            dim_mult = self.width[l+1][1]
+            
+            if self.mult_homo == True:
+                for i in range(self.mult_arity-1):
+                    if i == 0:
+                        x_mult = x[:,dim_sum::self.mult_arity] * x[:,dim_sum+1::self.mult_arity]
+                    else:
+                        x_mult = x_mult * x[:,dim_sum+i+1::self.mult_arity]
+                        
+            else:
+                for j in range(dim_mult):
+                    acml_id = dim_sum + np.sum(self.mult_arity[l+1][:j])
+                    for i in range(self.mult_arity[l+1][j]-1):
+                        if i == 0:
+                            x_mult_j = x[:,[acml_id]] * x[:,[acml_id+1]]
+                        else:
+                            x_mult_j = x_mult_j * x[:,[acml_id+i+1]]
+                            
+                    if j == 0:
+                        x_mult = x_mult_j
+                    else:
+                        x_mult = torch.cat([x_mult, x_mult_j], dim=1)
+                
+            if self.width[l+1][1] > 0:
+                x = torch.cat([x[:,:dim_sum], x_mult], dim=1)
+            
+            # x = x + self.biases[l].weight
+            # node affine transform
+            x = self.node_scale[l][None,:] * x + self.node_bias[l][None,:]
+            
+            self.acts.append(x.detach())
+            
+        
+        return x
