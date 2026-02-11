@@ -128,7 +128,6 @@ class NexusKANLayer(nn.Module):
         self.scale_sp = torch.nn.Parameter(torch.ones(in_dim, out_dim) * scale_sp * 1 / np.sqrt(in_dim) * self.mask).requires_grad_(sp_trainable)  # make scale trainable
         self.base_fun = base_fun
 
-        
         self.grid_eps = grid_eps
         
         self.to(device)
@@ -179,7 +178,9 @@ class NexusKANLayer(nn.Module):
         
         postacts = y.clone().permute(0,2,1)
             
-        y = torch.sum(y, dim=1)
+        # y = torch.sum(y, dim=1)
+        y = torch.prod(y, dim=1)
+        
         return y, preacts, postacts, postspline
 
     def update_grid_from_samples(self, x, mode='sample'):
