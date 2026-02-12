@@ -130,6 +130,12 @@ class NexusKANLayer(nn.Module):
 
         self.grid_eps = grid_eps
         
+        # interaction
+        
+        self.interact_w = torch.nn.Parameter(torch.rand(out_dim, )).requires_grad_(True)
+        
+        # /interaction
+        
         self.to(device)
         
     def to(self, device):
@@ -178,8 +184,8 @@ class NexusKANLayer(nn.Module):
         
         postacts = y.clone().permute(0,2,1)
             
-        # y = torch.sum(y, dim=1)
-        y = torch.prod(y, dim=1)
+        y = torch.sum(y, dim=1) + self.interact_w[None, :] * torch.prod(y, dim=1)
+        # y = torch.prod(y, dim=1)
         
         return y, preacts, postacts, postspline
 
