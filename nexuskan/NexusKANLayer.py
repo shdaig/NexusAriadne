@@ -118,6 +118,11 @@ class NexusKANLayer(nn.Module):
 
         self.coef = torch.nn.Parameter(curve2coef(self.grid[:,k:-k].permute(1,0), noises, self.grid, k))
         
+        # self.a = nn.Parameter(torch.ones(out_dim, in_dim)).requires_grad_(True)
+        # self.b = nn.Parameter(torch.ones(in_dim, )).requires_grad_(True)
+        # self.c = nn.Parameter(torch.zeros(in_dim, )).requires_grad_(True)
+        # self.d = nn.Parameter(torch.zeros(out_dim, in_dim)).requires_grad_(True)
+        
         if sparse_init:
             self.mask = torch.nn.Parameter(sparse_mask(in_dim, out_dim)).requires_grad_(False)
         else:
@@ -132,6 +137,7 @@ class NexusKANLayer(nn.Module):
         
         # interaction
         
+        self.sum_w = torch.nn.Parameter(torch.rand(in_dim, out_dim)).requires_grad_(True)
         self.interact_w = torch.nn.Parameter(torch.rand(out_dim, )).requires_grad_(True)
         
         # /interaction
@@ -173,9 +179,23 @@ class NexusKANLayer(nn.Module):
         '''
         batch = x.shape[0]
         preacts = x[:,None,:].clone().expand(batch, self.out_dim, self.in_dim)
-            
+        
+        # ---
+        # x_transformed = self.b[None, :] * x + self.c[None, :]
+        
+        # base = self.base_fun(x_transformed)
+        # y = coef2curve(x_eval=x_transformed, grid=self.grid, coef=self.coef, k=self.k)
+        # ---
+          
         base = self.base_fun(x) # (batch, in_dim)
         y = coef2curve(x_eval=x, grid=self.grid, coef=self.coef, k=self.k)
+        
+        # ---
+        # print(self.a.size())
+        # print(self.d.size())
+        # print(y.size())
+        # y = self.a[None, :, :] * y + self.d[None, :, :]
+        # ---
         
         postspline = y.clone().permute(0,2,1)
             
@@ -184,8 +204,9 @@ class NexusKANLayer(nn.Module):
         
         postacts = y.clone().permute(0,2,1)
             
-        y = torch.sum(y, dim=1) + self.interact_w[None, :] * torch.prod(y, dim=1)
+        # y = torch.sum(y, dim=1) + self.interact_w[None, :] * torch.prod(y, dim=1)
         # y = torch.prod(y, dim=1)
+        y = torch.sum(self.sum_w[None, :, :] * y, dim=1)
         
         return y, preacts, postacts, postspline
 
