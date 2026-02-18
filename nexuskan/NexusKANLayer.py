@@ -1,8 +1,13 @@
 import torch
 import torch.nn as nn
+
 import numpy as np
+
 from .spline import *
 from .utils import sparse_mask
+
+import math
+from itertools import combinations
 
 
 class NexusKANLayer(nn.Module):
@@ -138,7 +143,7 @@ class NexusKANLayer(nn.Module):
         # interaction
         
         self.sum_w = torch.nn.Parameter(torch.rand(in_dim, out_dim)).requires_grad_(True)
-        self.interact_w = torch.nn.Parameter(torch.rand(out_dim, )).requires_grad_(True)
+        self.interact_w = torch.nn.Parameter(torch.rand(math.comb(in_dim, 2), out_dim)).requires_grad_(True)
         
         # /interaction
         
@@ -178,38 +183,35 @@ class NexusKANLayer(nn.Module):
         >>> y.shape, preacts.shape, postacts.shape, postspline.shape
         '''
         batch = x.shape[0]
-        preacts = x[:,None,:].clone().expand(batch, self.out_dim, self.in_dim)
+        preacts = x[:,None,:].clone().expand(batch, self.out_dim, self.in_dim) # (batch, out_dim, in_dim)
         
-        # ---
-        # x_transformed = self.b[None, :] * x + self.c[None, :]
-        
-        # base = self.base_fun(x_transformed)
-        # y = coef2curve(x_eval=x_transformed, grid=self.grid, coef=self.coef, k=self.k)
-        # ---
-          
         base = self.base_fun(x) # (batch, in_dim)
-        y = coef2curve(x_eval=x, grid=self.grid, coef=self.coef, k=self.k)
+        y = coef2curve(x_eval=x, grid=self.grid, coef=self.coef, k=self.k) # (batch, in_dim, out_dim)
         
-        # ---
-        # print(self.a.size())
-        # print(self.d.size())
-        # print(y.size())
-        # y = self.a[None, :, :] * y + self.d[None, :, :]
-        # ---
-        
-        postspline = y.clone().permute(0,2,1)
+        postspline = y.clone().permute(0,2,1) # (batch, out_dim, in_dim)
             
-        y = self.scale_base[None,:,:] * base[:,:,None] + self.scale_sp[None,:,:] * y
-        y = self.mask[None,:,:] * y
+        y = self.scale_base[None,:,:] * base[:,:,None] + self.scale_sp[None,:,:] * y  # (batch, in_dim, out_dim)
+        y = self.mask[None,:,:] * y # (batch, in_dim, out_dim)
         
-        postacts = y.clone().permute(0,2,1)
-            
-        # y = torch.sum(y, dim=1) + self.interact_w[None, :] * torch.prod(y, dim=1)
-        # y = torch.prod(y, dim=1)
-        y = torch.sum(self.sum_w[None, :, :] * y, dim=1)
+        postacts = y.clone().permute(0,2,1) # (batch, out_dim, in_dim)
+        
+        # interactions
+        y_interact = self.pairwise_interactions(y) # (batch, C(in_dim, 2), out)
+        # print(y_interact.size())
+
+        # discrete_sum_w = torch.sigmoid(10. * self.sum_w[:, :])
+        # discrete_interact_w = torch.sigmoid(10. * self.interact_w[:, :])
+        
+        y = torch.sum(self.sum_w[None, :, :] * y, dim=1) + torch.sum(self.interact_w[None, :, :] * y_interact, dim=1)
+        # y = torch.sum(discrete_sum_w[None, :, :] * y, dim=1) + torch.sum(discrete_interact_w[None, :, :] * y_interact, dim=1)
         
         return y, preacts, postacts, postspline
 
+    def pairwise_interactions(self, x):
+        n_features = x.shape[1]
+        pairs = list(combinations(range(n_features), 2))
+        return torch.stack([x[:, i, :] * x[:, j, :] for i, j in pairs], dim=1)
+    
     def update_grid_from_samples(self, x, mode='sample'):
         '''
         update grid from samples
