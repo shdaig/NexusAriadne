@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import numpy as np
 
@@ -123,11 +124,6 @@ class NexusKANLayer(nn.Module):
 
         self.coef = torch.nn.Parameter(curve2coef(self.grid[:,k:-k].permute(1,0), noises, self.grid, k))
         
-        # self.a = nn.Parameter(torch.ones(out_dim, in_dim)).requires_grad_(True)
-        # self.b = nn.Parameter(torch.ones(in_dim, )).requires_grad_(True)
-        # self.c = nn.Parameter(torch.zeros(in_dim, )).requires_grad_(True)
-        # self.d = nn.Parameter(torch.zeros(out_dim, in_dim)).requires_grad_(True)
-        
         if sparse_init:
             self.mask = torch.nn.Parameter(sparse_mask(in_dim, out_dim)).requires_grad_(False)
         else:
@@ -142,8 +138,13 @@ class NexusKANLayer(nn.Module):
         
         # interaction
         
-        self.sum_w = torch.nn.Parameter(torch.rand(in_dim, out_dim)).requires_grad_(True)
-        self.interact_w = torch.nn.Parameter(torch.rand(math.comb(in_dim, 2), out_dim)).requires_grad_(True)
+        # v1
+        # self.sum_w = torch.nn.Parameter(torch.rand(in_dim, out_dim)).requires_grad_(True)
+        # self.interact_w = torch.nn.Parameter(torch.rand(math.comb(in_dim, 2), out_dim)).requires_grad_(True)
+        
+        # v2
+        self.prod_group_mask = torch.nn.Parameter(torch.zeros(in_dim, )).requires_grad_(True)
+        
         
         # /interaction
         
@@ -195,15 +196,25 @@ class NexusKANLayer(nn.Module):
         
         postacts = y.clone().permute(0,2,1) # (batch, out_dim, in_dim)
         
-        # interactions
-        y_interact = self.pairwise_interactions(y) # (batch, C(in_dim, 2), out)
-        # print(y_interact.size())
-
-        # discrete_sum_w = torch.sigmoid(10. * self.sum_w[:, :])
-        # discrete_interact_w = torch.sigmoid(10. * self.interact_w[:, :])
+        # interactions v1
+        # y_interact = self.pairwise_interactions(y) # (batch, C(in_dim, 2), out)
+        # y = torch.sum(self.sum_w[None, :, :] * y, dim=1) + torch.sum(self.interact_w[None, :, :] * y_interact, dim=1)
         
-        y = torch.sum(self.sum_w[None, :, :] * y, dim=1) + torch.sum(self.interact_w[None, :, :] * y_interact, dim=1)
-        # y = torch.sum(discrete_sum_w[None, :, :] * y, dim=1) + torch.sum(discrete_interact_w[None, :, :] * y_interact, dim=1)
+        # interactions v2
+        tau = 0.1
+        mask = torch.sigmoid(self.prod_group_mask / tau)
+        
+        epsilon = 1e-8
+        sign_data = torch.sign(y + epsilon) 
+        selected_signs = torch.where(mask[:, None] > 0.5, sign_data, 1.0)
+        final_sign = torch.prod(selected_signs, dim=1)
+
+        masked_y_for_prod = torch.pow(torch.abs(y), mask[:, None])
+        y_prod = torch.prod(masked_y_for_prod, dim=1)
+
+        masked_y_for_sum = y * (1. - mask[:, None])
+
+        y = torch.sum(masked_y_for_sum, dim=1) + y_prod * final_sign
         
         return y, preacts, postacts, postspline
 
