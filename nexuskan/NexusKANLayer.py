@@ -143,8 +143,8 @@ class NexusKANLayer(nn.Module):
         # self.interact_w = torch.nn.Parameter(torch.rand(math.comb(in_dim, 2), out_dim)).requires_grad_(True)
         
         # v2
-        self.prod_group_mask = torch.nn.Parameter(torch.zeros(in_dim, )).requires_grad_(True)
-        
+        # self.prod_group_mask = torch.nn.Parameter(torch.rand(in_dim, 1)).requires_grad_(True)
+        self.prod_group_mask = torch.nn.Parameter(torch.rand(in_dim, np.max([1, in_dim // 2]))).requires_grad_(True)
         
         # /interaction
         
@@ -202,19 +202,21 @@ class NexusKANLayer(nn.Module):
         
         # interactions v2
         tau = 0.1
-        mask = torch.sigmoid(self.prod_group_mask / tau)
+        mask = torch.sigmoid(self.prod_group_mask / tau) # (in_dim, in_dim // 2)
         
         epsilon = 1e-8
-        sign_data = torch.sign(y + epsilon) 
-        selected_signs = torch.where(mask[:, None] > 0.5, sign_data, 1.0)
-        final_sign = torch.prod(selected_signs, dim=1)
+        sign_data = torch.sign(y + epsilon) # (batch, in_dim, out_dim)
+        mask_expanded = mask[None, :, None, :] # (1, in_dim, 1, groups)
+        sign_data_expanded = sign_data.unsqueeze(-1) # (batch, in_dim, out_dim, 1)
+        selected_signs = torch.where(mask_expanded > 0.5, sign_data_expanded, 1.0) # (batch, in_dim, out_dim, in_dim // 2)
+        final_sign = torch.prod(selected_signs, dim=1) # (batch, out_dim, in_dim // 2)
 
-        masked_y_for_prod = torch.pow(torch.abs(y), mask[:, None])
-        y_prod = torch.prod(masked_y_for_prod, dim=1)
+        masked_y_for_prod = torch.pow(torch.abs(y.unsqueeze(-1)), mask[None, :, None, :]) # (batch, in_dim, out_dim, in_dim // 2)
+        y_prod = torch.prod(masked_y_for_prod, dim=1) # (batch, out_dim, in_dim // 2)
 
-        masked_y_for_sum = y * (1. - mask[:, None])
+        masked_y_for_sum = y * (1. - torch.sum(mask, dim=1)[:, None]) # (batch, in_dim, out_dim)
 
-        y = torch.sum(masked_y_for_sum, dim=1) + y_prod * final_sign
+        y = torch.sum(masked_y_for_sum, dim=1) + torch.sum(y_prod * final_sign, dim=2)
         
         return y, preacts, postacts, postspline
 
