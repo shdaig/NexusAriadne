@@ -12,41 +12,6 @@ from itertools import combinations
 
 
 class NexusKANLayer(nn.Module):
-    """
-    NexusKANLayer class
-    
-
-    Attributes:
-    -----------
-        in_dim: int
-            input dimension
-        out_dim: int
-            output dimension
-        num: int
-            the number of grid intervals
-        k: int
-            the piecewise polynomial order of splines
-        noise_scale: float
-            spline scale at initialization
-        coef: 2D torch.tensor
-            coefficients of B-spline bases
-        scale_base_mu: float
-            magnitude of the residual function b(x) is drawn from N(mu, sigma^2), mu = sigma_base_mu
-        scale_base_sigma: float
-            magnitude of the residual function b(x) is drawn from N(mu, sigma^2), mu = sigma_base_sigma
-        scale_sp: float
-            mangitude of the spline function spline(x)
-        base_fun: fun
-            residual function b(x)
-        mask: 1D torch.float
-            mask of spline functions. setting some element of the mask to zero means setting the corresponding activation to zero function.
-        grid_eps: float in [0,1]
-            a hyperparameter used in update_grid_from_samples. When grid_eps = 1, the grid is uniform; when grid_eps = 0, the grid is partitioned using percentiles of samples. 0 < grid_eps < 1 interpolates between the two extremes.
-            the id of activation functions that are locked
-        device: str
-            device
-    """
-
     def __init__(self,
                  in_dim=3,
                  out_dim=2, 
@@ -64,52 +29,6 @@ class NexusKANLayer(nn.Module):
                  save_plot_data = True, 
                  device='cpu', 
                  sparse_init=False):
-        ''''
-        initialize a KANLayer
-        
-        Args:
-        -----
-            in_dim : int
-                input dimension. Default: 2.
-            out_dim : int
-                output dimension. Default: 3.
-            num : int
-                the number of grid intervals = G. Default: 5.
-            k : int
-                the order of piecewise polynomial. Default: 3.
-            noise_scale : float
-                the scale of noise injected at initialization. Default: 0.1.
-            scale_base_mu : float
-                the scale of the residual function b(x) is intialized to be N(scale_base_mu, scale_base_sigma^2).
-            scale_base_sigma : float
-                the scale of the residual function b(x) is intialized to be N(scale_base_mu, scale_base_sigma^2).
-            scale_sp : float
-                the scale of the base function spline(x).
-            base_fun : function
-                residual function b(x). Default: torch.nn.SiLU()
-            grid_eps : float
-                When grid_eps = 1, the grid is uniform; when grid_eps = 0, the grid is partitioned using percentiles of samples. 0 < grid_eps < 1 interpolates between the two extremes.
-            grid_range : list/np.array of shape (2,)
-                setting the range of grids. Default: [-1,1].
-            sp_trainable : bool
-                If true, scale_sp is trainable
-            sb_trainable : bool
-                If true, scale_base is trainable
-            device : str
-                device
-            sparse_init : bool
-                if sparse_init = True, sparse initialization is applied.
-            
-        Returns:
-        --------
-            self
-            
-        Example
-        -------
-        >>> from kan.KANLayer import *
-        >>> model = KANLayer(in_dim=3, out_dim=5)
-        >>> (model.in_dim, model.out_dim)
-        '''
         super(NexusKANLayer, self).__init__()
         # size 
         self.out_dim = out_dim
@@ -143,8 +62,12 @@ class NexusKANLayer(nn.Module):
         # self.interact_w = torch.nn.Parameter(torch.rand(math.comb(in_dim, 2), out_dim)).requires_grad_(True)
         
         # v2
+        self.tau = 2.0
         # self.prod_group_mask = torch.nn.Parameter(torch.rand(in_dim, 1)).requires_grad_(True)
-        self.prod_group_mask = torch.nn.Parameter(torch.rand(in_dim, np.max([1, in_dim // 2]))).requires_grad_(True)
+        # self.prod_group_mask = torch.nn.Parameter(torch.rand(in_dim, np.max([1, in_dim // 2]))).requires_grad_(True)
+        self.logits = torch.nn.Parameter(torch.rand(in_dim, in_dim // 2 + 1)).requires_grad_(True)
+        # self.prod_group_mask = torch.nn.Parameter(torch.rand(in_dim, np.max([1, in_dim // 2])) - 1.5 * self.tau).requires_grad_(True)
+        # self.prod_group_mask = torch.nn.Parameter(torch.zeros(in_dim, np.max([1, in_dim // 2])) * 0.01).requires_grad_(True)
         
         # /interaction
         
@@ -156,33 +79,6 @@ class NexusKANLayer(nn.Module):
         return self
 
     def forward(self, x):
-        '''
-        KANLayer forward given input x
-        
-        Args:
-        -----
-            x : 2D torch.float
-                inputs, shape (number of samples, input dimension)
-            
-        Returns:
-        --------
-            y : 2D torch.float
-                outputs, shape (number of samples, output dimension)
-            preacts : 3D torch.float
-                fan out x into activations, shape (number of sampels, output dimension, input dimension)
-            postacts : 3D torch.float
-                the outputs of activation functions with preacts as inputs
-            postspline : 3D torch.float
-                the outputs of spline functions with preacts as inputs
-        
-        Example
-        -------
-        >>> from kan.KANLayer import *
-        >>> model = KANLayer(in_dim=3, out_dim=5)
-        >>> x = torch.normal(0,1,size=(100,3))
-        >>> y, preacts, postacts, postspline = model(x)
-        >>> y.shape, preacts.shape, postacts.shape, postspline.shape
-        '''
         batch = x.shape[0]
         preacts = x[:,None,:].clone().expand(batch, self.out_dim, self.in_dim) # (batch, out_dim, in_dim)
         
@@ -201,22 +97,25 @@ class NexusKANLayer(nn.Module):
         # y = torch.sum(self.sum_w[None, :, :] * y, dim=1) + torch.sum(self.interact_w[None, :, :] * y_interact, dim=1)
         
         # interactions v2
-        tau = 0.1
-        mask = torch.sigmoid(self.prod_group_mask / tau) # (in_dim, in_dim // 2)
+        # mask = torch.sigmoid(self.prod_group_mask / self.tau) # (in_dim, in_dim // 2)
+        # masked_y_for_prod = 1 - mask[None, :, None, :] + mask[None, :, None, :] * y.unsqueeze(-1) # (batch, in_dim, out_dim, in_dim // 2)
+        # y_prod = torch.prod(masked_y_for_prod, dim=1) # (batch, out_dim, in_dim // 2)
+        # masked_y_for_sum = y * (1. - torch.sum(mask, dim=1)[:, None]) # (batch, in_dim, out_dim)
+        # y = torch.sum(masked_y_for_sum, dim=1) + torch.sum(y_prod, dim=2)
         
-        epsilon = 1e-8
-        sign_data = torch.sign(y + epsilon) # (batch, in_dim, out_dim)
-        mask_expanded = mask[None, :, None, :] # (1, in_dim, 1, groups)
-        sign_data_expanded = sign_data.unsqueeze(-1) # (batch, in_dim, out_dim, 1)
-        selected_signs = torch.where(mask_expanded > 0.5, sign_data_expanded, 1.0) # (batch, in_dim, out_dim, in_dim // 2)
-        final_sign = torch.prod(selected_signs, dim=1) # (batch, out_dim, in_dim // 2)
+        # interactions v3
+        probs = torch.softmax(self.logits / self.tau, dim=-1)     # (in_dim, groups+1)
+        prod_probs = probs[:, :-1]                                # (in_dim, groups)
+        sum_probs = probs[:, -1]                                  # (in_dim)
 
-        masked_y_for_prod = torch.pow(torch.abs(y.unsqueeze(-1)), mask[None, :, None, :]) # (batch, in_dim, out_dim, in_dim // 2)
-        y_prod = torch.prod(masked_y_for_prod, dim=1) # (batch, out_dim, in_dim // 2)
+        prod_probs = prod_probs[None, :, None, :]                 # (1, in_dim, 1, groups)
+        sum_probs = sum_probs[None, :, None]                      # (1, in_dim, 1)
 
-        masked_y_for_sum = y * (1. - torch.sum(mask, dim=1)[:, None]) # (batch, in_dim, out_dim)
-
-        y = torch.sum(masked_y_for_sum, dim=1) + torch.sum(y_prod * final_sign, dim=2)
+        term = 1 - prod_probs + prod_probs * y.unsqueeze(-1)
+        y_prod = torch.prod(term, dim=1)                          # (batch, out_dim, groups)
+        y_sum = torch.sum(y * sum_probs, dim=1)                   # (batch, out_dim)
+        
+        y = y_sum + torch.sum(y_prod, dim=2) 
         
         return y, preacts, postacts, postspline
 
