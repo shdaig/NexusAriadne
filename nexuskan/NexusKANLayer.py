@@ -62,10 +62,11 @@ class NexusKANLayer(nn.Module):
         # self.interact_w = torch.nn.Parameter(torch.rand(math.comb(in_dim, 2), out_dim)).requires_grad_(True)
         
         # v2
+        # self.tau = 2.0
         self.tau = 2.0
         # self.prod_group_mask = torch.nn.Parameter(torch.rand(in_dim, 1)).requires_grad_(True)
         # self.prod_group_mask = torch.nn.Parameter(torch.rand(in_dim, np.max([1, in_dim // 2]))).requires_grad_(True)
-        self.logits = torch.nn.Parameter(torch.rand(in_dim, in_dim // 2 + 1)).requires_grad_(True)
+        self.logits = torch.nn.Parameter(torch.rand(in_dim, out_dim, in_dim // 2 + 1)).requires_grad_(True)
         # self.prod_group_mask = torch.nn.Parameter(torch.rand(in_dim, np.max([1, in_dim // 2])) - 1.5 * self.tau).requires_grad_(True)
         # self.prod_group_mask = torch.nn.Parameter(torch.zeros(in_dim, np.max([1, in_dim // 2])) * 0.01).requires_grad_(True)
         
@@ -104,12 +105,12 @@ class NexusKANLayer(nn.Module):
         # y = torch.sum(masked_y_for_sum, dim=1) + torch.sum(y_prod, dim=2)
         
         # interactions v3
-        probs = torch.softmax(self.logits / self.tau, dim=-1)     # (in_dim, groups+1)
-        prod_probs = probs[:, :-1]                                # (in_dim, groups)
-        sum_probs = probs[:, -1]                                  # (in_dim)
+        probs = torch.softmax(self.logits / self.tau, dim=-1)     # (in_dim, out_dim, groups+1)
+        prod_probs = probs[:, :, :-1]                                # (in_dim, out_dim, groups)
+        sum_probs = probs[:, :, -1]                                  # (in_dim, out_dim)
 
-        prod_probs = prod_probs[None, :, None, :]                 # (1, in_dim, 1, groups)
-        sum_probs = sum_probs[None, :, None]                      # (1, in_dim, 1)
+        prod_probs = prod_probs[None, :, :, :]                 # (1, in_dim, out_dim, groups)
+        sum_probs = sum_probs[None, :, :]                      # (1, in_dim, out_dim)
 
         term = 1 - prod_probs + prod_probs * y.unsqueeze(-1)
         y_prod = torch.prod(term, dim=1)                          # (batch, out_dim, groups)
