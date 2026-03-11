@@ -63,7 +63,7 @@ class NexusKANLayer(nn.Module):
         
         # v2
         # self.tau = 2.0
-        self.tau = 2.0
+        self.tau = 1.0
         # self.prod_group_mask = torch.nn.Parameter(torch.rand(in_dim, 1)).requires_grad_(True)
         # self.prod_group_mask = torch.nn.Parameter(torch.rand(in_dim, np.max([1, in_dim // 2]))).requires_grad_(True)
         self.logits = torch.nn.Parameter(torch.rand(in_dim, out_dim, in_dim // 2 + 1)).requires_grad_(True)
@@ -106,6 +106,8 @@ class NexusKANLayer(nn.Module):
         
         # interactions v3
         probs = torch.softmax(self.logits / self.tau, dim=-1)     # (in_dim, out_dim, groups+1)
+        # probs = F.gumbel_softmax(self.logits, tau=self.tau, hard=True, dim=-1) # (in_dim, out_dim, groups+1)
+        
         prod_probs = probs[:, :, :-1]                                # (in_dim, out_dim, groups)
         sum_probs = probs[:, :, -1]                                  # (in_dim, out_dim)
 
