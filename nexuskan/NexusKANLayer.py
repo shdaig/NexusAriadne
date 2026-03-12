@@ -93,21 +93,7 @@ class NexusKANLayer(nn.Module):
         
         postacts = y.clone().permute(0,2,1) # (batch, out_dim, in_dim)
         
-        # interactions v1
-        # y_interact = self.pairwise_interactions(y) # (batch, C(in_dim, 2), out)
-        # y = torch.sum(self.sum_w[None, :, :] * y, dim=1) + torch.sum(self.interact_w[None, :, :] * y_interact, dim=1)
-        
-        # interactions v2
-        # mask = torch.sigmoid(self.prod_group_mask / self.tau) # (in_dim, in_dim // 2)
-        # masked_y_for_prod = 1 - mask[None, :, None, :] + mask[None, :, None, :] * y.unsqueeze(-1) # (batch, in_dim, out_dim, in_dim // 2)
-        # y_prod = torch.prod(masked_y_for_prod, dim=1) # (batch, out_dim, in_dim // 2)
-        # masked_y_for_sum = y * (1. - torch.sum(mask, dim=1)[:, None]) # (batch, in_dim, out_dim)
-        # y = torch.sum(masked_y_for_sum, dim=1) + torch.sum(y_prod, dim=2)
-        
-        # interactions v3
         probs = torch.softmax(self.logits / self.tau, dim=-1)     # (in_dim, out_dim, groups+1)
-        # probs = F.gumbel_softmax(self.logits, tau=self.tau, hard=True, dim=-1) # (in_dim, out_dim, groups+1)
-        
         prod_probs = probs[:, :, :-1]                                # (in_dim, out_dim, groups)
         sum_probs = probs[:, :, -1]                                  # (in_dim, out_dim)
 
