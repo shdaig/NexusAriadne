@@ -64,12 +64,8 @@ class NexusKANLayer(nn.Module):
         # v2
         # self.tau = 2.0
         self.tau = 1.0
-        # self.prod_group_mask = torch.nn.Parameter(torch.rand(in_dim, 1)).requires_grad_(True)
-        # self.prod_group_mask = torch.nn.Parameter(torch.rand(in_dim, np.max([1, in_dim // 2]))).requires_grad_(True)
         self.logits = torch.nn.Parameter(torch.rand(in_dim, out_dim, in_dim // 2 + 1)).requires_grad_(True)
-        # self.prod_group_mask = torch.nn.Parameter(torch.rand(in_dim, np.max([1, in_dim // 2])) - 1.5 * self.tau).requires_grad_(True)
-        # self.prod_group_mask = torch.nn.Parameter(torch.zeros(in_dim, np.max([1, in_dim // 2])) * 0.01).requires_grad_(True)
-        
+        # self.logits = torch.nn.Parameter(torch.rand(in_dim, 1, in_dim // 2 + 1)).requires_grad_(True)
         # /interaction
         
         self.to(device)
