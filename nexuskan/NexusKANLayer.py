@@ -90,6 +90,7 @@ class NexusKANLayer(nn.Module):
         postacts = y.clone().permute(0,2,1) # (batch, out_dim, in_dim)
         
         probs = torch.softmax(self.logits / self.tau, dim=-1)     # (in_dim, out_dim, groups+1)
+        # probs = F.gumbel_softmax(self.logits, self.tau, hard=False, dim=-1)
         prod_probs = probs[:, :, :-1]                                # (in_dim, out_dim, groups)
         sum_probs = probs[:, :, -1]                                  # (in_dim, out_dim)
 
