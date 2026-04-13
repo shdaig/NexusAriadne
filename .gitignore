@@ -3,3 +3,4 @@ temp_*/
 __pycache__/
 model/
 figures/
+outputs/
