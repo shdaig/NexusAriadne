@@ -37,7 +37,7 @@ except ImportError:
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-N_RUNS  = 5
+N_RUNS  = 3
 EPOCHS  = 500
 STEPS   = 500
 N_TRAIN = 1000

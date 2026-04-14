@@ -27,7 +27,7 @@ from nexuskan import NexusKAN, NexusKANLayer
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-N_RUNS  = 10
+N_RUNS  = 3
 EPOCHS  = 300
 LO, HI  = 0.1, 1.0
 N_TRAIN, N_TEST = 1000, 200
@@ -72,12 +72,14 @@ def _get_lamb(epoch, epochs, lamb_start=1e-2, lamb_end=10.0):
 class NexusKANWithFC(nn.Module):
     def __init__(self, kan_width, seed=0):
         super().__init__()
+        # Read out_dim before NexusKAN mutates the width list in-place
+        out_dim = kan_width[-1] if isinstance(kan_width[-1], int) else kan_width[-1][0]
         self.kan = NexusKAN(
             width=kan_width, grid=5, k=3,
             grid_range=[LO, HI],
             seed=seed, auto_save=False, device=device,
         )
-        self.fc = nn.Linear(kan_width[-1], 1)
+        self.fc = nn.Linear(out_dim, 1)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
