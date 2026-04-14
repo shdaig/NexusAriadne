@@ -676,43 +676,48 @@ class NexusKAN(nn.Module):
             print('y range: [' + '%.2f' % y_min, ',', '%.2f' % y_max, ']')
         return x_min, x_max, y_min, y_max
 
-    def plot(self, folder="./figures", beta=3, metric='backward', scale=0.5, tick=False, sample=False, in_vars=None, out_vars=None, title=None, varscale=1.0):
-        '''
-        plot KAN
-        
-        Args:
-        -----
-            folder : str
-                the folder to store pngs
-            beta : float
-                positive number. control the transparency of each activation. transparency = tanh(beta*l1).
-            mask : bool
-                If True, plot with mask (need to run prune() first to obtain mask). If False (by default), plot all activation functions.
-            mode : bool
-                "supervised" or "unsupervised". If "supervised", l1 is measured by absolution value (not subtracting mean); if "unsupervised", l1 is measured by standard deviation (subtracting mean).
-            scale : float
-                control the size of the diagram
-            in_vars: None or list of str
-                the name(s) of input variables
-            out_vars: None or list of str
-                the name(s) of output variables
-            title: None or str
-                title
-            varscale : float
-                the size of input variables
-            
-        Returns:
-        --------
-            Figure
-            
-        Example
+    def plot(self, folder="./figures", beta=3, metric='backward', scale=0.5, tick=False,
+             sample=False, in_vars=None, out_vars=None, title=None, varscale=1.0,
+             tau_decode=0.05, save_path=None):
+        """
+        Draw the NexusKAN network diagram.
+
+        Edges are colored by the dominant operation assignment decoded from
+        softmax(logits / tau_decode):
+          blue   → summation path
+          orange → multiplicative group 0
+          green  → multiplicative group 1
+          red    → multiplicative group 2
+
+        Parameters
+        ----------
+        folder     : unused — kept for API compatibility
+        beta       : tanh sharpness for edge alpha transparency
+        metric     : 'forward_n' | 'forward_u' | 'backward'
+        scale      : overall figure size multiplier
+        tick       : show tick marks on spline insets
+        sample     : scatter data points on spline insets
+        in_vars    : list of input variable names / sympy expressions
+        out_vars   : list of output variable names / sympy expressions
+        title      : figure title
+        varscale   : font size multiplier for variable labels
+        tau_decode : softmax temperature for operation decoding (low = sharp)
+        save_path  : if set, save figure to this path
+
+        Returns
         -------
-        >>> # see more interactive examples in demos
-        >>> model = KAN(width=[2,3,1], grid=3, k=3, noise_scale=1.0)
-        >>> x = torch.normal(0,1,size=(100,2))
-        >>> model(x) # do a forward pass to obtain model.acts
-        >>> model.plot()
-        '''
+        matplotlib.figure.Figure
+        """
+        from .nexus_plot import plot_nexus_network
+        return plot_nexus_network(
+            self, folder=folder, beta=beta, metric=metric,
+            scale=scale, tick=tick, sample=sample,
+            in_vars=in_vars, out_vars=out_vars, title=title,
+            varscale=varscale, tau_decode=tau_decode, save_path=save_path,
+        )
+
+    def _plot_legacy(self, folder="./figures", beta=3, metric='backward', scale=0.5, tick=False, sample=False, in_vars=None, out_vars=None, title=None, varscale=1.0):
+        '''Legacy MultKAN-derived plot (kept for reference — not used by NexusKAN).'''
         global Symbol
         
         if not self.save_act:
