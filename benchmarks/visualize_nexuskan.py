@@ -1,18 +1,23 @@
 """
 NexusKAN visualization demo.
 
-Trains four NexusKAN models on representative tasks and produces three
-types of visualization for each:
-  1. Network diagram  — inline spline curves, edges colored by learned operation
-  2. Logit heatmap    — per-layer P(sum) matrix derived from softmax(logits/τ)
-  3. Activation gallery — grid of all learned B-spline curves
+Trains five NexusKAN models on representative tasks and produces
+visualizations for each:
+  1. Network diagram      -- inline spline curves, edges colored by learned operation
+  2. Logit heatmap        -- per-layer P(sum) matrix derived from softmax(logits/tau)
+  3. Activation gallery   -- grid of all learned B-spline curves
+  4. KAN+FC flow diagram  -- per-cell spline thumbnails on P(sum) background for KAN
+                             layers, weight-magnitude heatmaps for FC layers
+                             (Scenarios D and E only)
 
 Scenarios
 ---------
-A  SR Stage 2 : x0/x1 + x2/x3         NexusKAN([4,4,1])
-B  Nonlinear  : 1/x0 + 1/x1            NexusKAN([2,4,1])  (inverse pair)
-C  Nonlinear  : sin(2π x0)·sin(2π x1)  NexusKAN([2,4,1])  (sine product)
-D  Classif.   : x0/x3 + x1/x2 > 2.2   NexusKAN([4,4,1]) + FC head
+A  SR Stage 2    : x0/x1 + x2/x3            NexusKAN([4,4,1])
+B  Nonlinear     : 1/x0 + 1/x1              NexusKAN([2,4,1])  (inverse pair)
+C  Nonlinear     : sin(2pi x0)*sin(2pi x1)  NexusKAN([2,4,1])  (sine product)
+D  Classif.      : x0/x3 + x1/x2 > 2.2     NexusKAN([4,4]) + FC head
+E  Hybrid regr.  : sin(2pi x0)*sin(2pi x1)  NexusKAN([2,4,4]) + 3-layer FC
+   (from kan_fc_nonlinear T2 -- showcases multiplication operation discovery)
 
 All figures saved to <project_root>/figures/.
 
@@ -37,12 +42,14 @@ from nexuskan.nexus_plot import (
     plot_nexus_network,
     plot_ops_heatmap,
     plot_activation_gallery,
+    plot_kan_fc_architecture,
 )
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 EPOCHS_SR   = 500
 EPOCHS_CLS  = 300
+EPOCHS_HYB  = 400
 LR_START    = 0.1
 LR_END      = 1e-3
 TAU_START   = 2.0
@@ -50,7 +57,7 @@ TAU_END     = 0.1
 LAMB_START  = 1e-2
 LAMB_END    = 10.0
 LAMB_L1_ACTS  = 1e-2   # L1 regularization on acts_scale_spline
-LAMB_ENT_ACTS = 1e-2   # entropy regularization on acts_scale_spline
+LAMB_ENT_ACTS = 1e-3   # entropy regularization on acts_scale_spline
 N_TRAIN     = 800
 N_TEST      = 200
 BATCH       = 64
@@ -143,7 +150,7 @@ def train_nexuskan_regression(model, ds, epochs=EPOCHS_SR):
 
 
 # ---------------------------------------------------------------------------
-# Scenario A — SR Stage 2: x0/x1 + x2/x3
+# Scenario A -- SR Stage 2: x0/x1 + x2/x3
 # ---------------------------------------------------------------------------
 
 def scenario_a():
@@ -168,27 +175,27 @@ def scenario_a():
     train_nexuskan_regression(model, ds, epochs=EPOCHS_SR)
 
     r2 = 1 - ((model(ds['test_input']) - ds['test_label'])**2).mean().item() / ds['test_label'].var().item()
-    print(f'  Test R²: {r2:.4f}')
+    print(f'  Test R2: {r2:.4f}')
 
     stem = 'sr_stage2'
     plot_nexus_network(
         model, metric='forward_n', scale=0.7,
-        in_vars=['x₀', 'x₁', 'x₂', 'x₃'], out_vars=['y'],
-        title='Stage 2: x₀/x₁ + x₂/x₃',
+        in_vars=['x0', 'x1', 'x2', 'x3'], out_vars=['y'],
+        title='Stage 2: x0/x1 + x2/x3',
         save_path=os.path.join(OUT_DIR, f'{stem}_network.png'),
     )
     plot_ops_heatmap(
-        model, title='Stage 2 — operation probabilities',
+        model, title='Stage 2 - operation probabilities',
         save_path=os.path.join(OUT_DIR, f'{stem}_ops.png'),
     )
     plot_activation_gallery(
-        model, title='Stage 2 — B-spline activations',
+        model, title='Stage 2 - B-spline activations',
         save_path=os.path.join(OUT_DIR, f'{stem}_splines.png'),
     )
 
 
 # ---------------------------------------------------------------------------
-# Scenario B — Nonlinear: 1/x0 + 1/x1  (inverse pair)
+# Scenario B -- Nonlinear: 1/x0 + 1/x1  (inverse pair)
 # ---------------------------------------------------------------------------
 
 def scenario_b():
@@ -213,31 +220,31 @@ def scenario_b():
     train_nexuskan_regression(model, ds, epochs=EPOCHS_SR)
 
     r2 = 1 - ((model(ds['test_input']) - ds['test_label'])**2).mean().item() / ds['test_label'].var().item()
-    print(f'  Test R²: {r2:.4f}')
+    print(f'  Test R2: {r2:.4f}')
 
     stem = 'nonlinear_inverse'
     plot_nexus_network(
         model, metric='forward_n', scale=0.7,
-        in_vars=['x₀', 'x₁'], out_vars=['y'],
-        title='Inverse pair: 1/x₀ + 1/x₁',
+        in_vars=['x0', 'x1'], out_vars=['y'],
+        title='Inverse pair: 1/x0 + 1/x1',
         save_path=os.path.join(OUT_DIR, f'{stem}_network.png'),
     )
     plot_ops_heatmap(
-        model, title='Inverse pair — operation probabilities',
+        model, title='Inverse pair - operation probabilities',
         save_path=os.path.join(OUT_DIR, f'{stem}_ops.png'),
     )
     plot_activation_gallery(
-        model, title='Inverse pair — B-spline activations',
+        model, title='Inverse pair - B-spline activations',
         save_path=os.path.join(OUT_DIR, f'{stem}_splines.png'),
     )
 
 
 # ---------------------------------------------------------------------------
-# Scenario C — Nonlinear: sin(2π x0) · sin(2π x1)  (sine product)
+# Scenario C -- Nonlinear: sin(2pi x0) * sin(2pi x1)  (sine product)
 # ---------------------------------------------------------------------------
 
 def scenario_c():
-    print('\n=== Scenario C: Sine product  (sin(2π x0)·sin(2π x1)) ===')
+    print('\n=== Scenario C: Sine product  (sin(2pi x0)*sin(2pi x1)) ===')
     torch.manual_seed(2); np.random.seed(2)
 
     x = torch.rand(N_TRAIN + N_TEST, 2)
@@ -257,27 +264,27 @@ def scenario_c():
     train_nexuskan_regression(model, ds, epochs=EPOCHS_SR)
 
     r2 = 1 - ((model(ds['test_input']) - ds['test_label'])**2).mean().item() / ds['test_label'].var().item()
-    print(f'  Test R²: {r2:.4f}')
+    print(f'  Test R2: {r2:.4f}')
 
     stem = 'nonlinear_sine'
     plot_nexus_network(
         model, metric='forward_n', scale=0.7,
-        in_vars=['x₀', 'x₁'], out_vars=['y'],
-        title='Sine product: sin(2π x₀)·sin(2π x₁)',
+        in_vars=['x0', 'x1'], out_vars=['y'],
+        title='Sine product: sin(2pi x0)*sin(2pi x1)',
         save_path=os.path.join(OUT_DIR, f'{stem}_network.png'),
     )
     plot_ops_heatmap(
-        model, title='Sine product — operation probabilities',
+        model, title='Sine product - operation probabilities',
         save_path=os.path.join(OUT_DIR, f'{stem}_ops.png'),
     )
     plot_activation_gallery(
-        model, title='Sine product — B-spline activations',
+        model, title='Sine product - B-spline activations',
         save_path=os.path.join(OUT_DIR, f'{stem}_splines.png'),
     )
 
 
 # ---------------------------------------------------------------------------
-# Scenario D — Classification: x0/x3 + x1/x2 > 2.2  (NexusKAN + FC)
+# Scenario D -- Classification: x0/x3 + x1/x2 > 2.2  (NexusKAN + FC)
 # ---------------------------------------------------------------------------
 
 class _NexusKANWithFC(nn.Module):
@@ -311,7 +318,7 @@ def scenario_d():
         'test_label':  y[N_TR:].to(device),
     }
 
-    model = _NexusKANWithFC(kan_width=[4, 4, 1], seed=3).to(device)
+    model = _NexusKANWithFC(kan_width=[4, 4], seed=3).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LR_START)
     criterion = nn.BCELoss()
 
@@ -364,17 +371,153 @@ def scenario_d():
 
     stem = 'cls_division'
     plot_nexus_network(
-        model.kan, metric='forward_n', scale=0.7,
-        in_vars=['x₀', 'x₁', 'x₂', 'x₃'],
-        title='Classification: x₀/x₃ + x₁/x₂ > 2.2',
+        model.kan, fc_module=model.fc, metric='forward_n', scale=0.7,
+        in_vars=['x0', 'x1', 'x2', 'x3'], out_vars=['y'],
+        title='Classification: x0/x3 + x1/x2 > 2.2',
         save_path=os.path.join(OUT_DIR, f'{stem}_network.png'),
     )
     plot_ops_heatmap(
-        model.kan, title='Classification — operation probabilities',
+        model.kan, title='Classification - operation probabilities',
         save_path=os.path.join(OUT_DIR, f'{stem}_ops.png'),
     )
     plot_activation_gallery(
-        model.kan, title='Classification — B-spline activations',
+        model.kan, title='Classification - B-spline activations',
+        save_path=os.path.join(OUT_DIR, f'{stem}_splines.png'),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scenario E -- Hybrid regression: sin(2pi x0)*sin(2pi x1)
+#               NexusKAN([2,4,4]) + FC([4->8->4->1])
+#               (kan_fc_nonlinear T2 -- sine product, expects Pi operations)
+# ---------------------------------------------------------------------------
+
+class _NexusKANMultiFC(nn.Module):
+    """NexusKAN feature extractor followed by three FC layers."""
+
+    def __init__(self, n_inputs, h_kan=4, h_fc=8, seed=0):
+        super().__init__()
+        self.kan = NexusKAN(
+            width=[n_inputs, h_kan], grid=5, k=3,
+            grid_range=[0.0, 1.0],
+            seed=seed, auto_save=False, device=device,
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(h_kan, h_fc),
+            nn.SiLU(),
+            nn.Linear(h_fc, h_fc // 2),
+            nn.SiLU(),
+            nn.Linear(h_fc // 2, 1),
+        )
+
+    def forward(self, x):
+        return self.fc(self.kan(x))
+
+
+def _train_hybrid_regression(model, ds, epochs=EPOCHS_HYB):
+    """Train a _NexusKANMultiFC on a regression task."""
+    optimizer = optim.Adam(model.parameters(), lr=1e-2)
+    criterion = nn.MSELoss()
+
+    with torch.no_grad():
+        model.kan.update_grid(ds['train_input'])
+
+    for epoch in range(epochs):
+        idx = torch.randperm(N_TRAIN, device=device)
+        for bi in range(max(N_TRAIN // BATCH, 1)):
+            batch_idx = idx[bi * BATCH : (bi + 1) * BATCH]
+            bx = ds['train_input'][batch_idx]
+            by = ds['train_label'][batch_idx]
+
+            lr_now  = 1e-2 * (1e-4 / 1e-2) ** (epoch / max(epochs - 1, 1))
+            tau_now = 2.0  * (0.05  / 2.0)  ** (epoch / max(epochs - 1, 1))
+            for pg in optimizer.param_groups:
+                pg['lr'] = lr_now
+            for m in model.modules():
+                if isinstance(m, NexusKANLayer):
+                    m.tau = tau_now
+
+            out  = model(bx)
+            loss = criterion(out, by)
+
+            # Entropy regularization on operation logits (annealed)
+            lamb_ent = 1e-3 * (5.0 / 1e-3) ** (epoch / max(epochs - 1, 1))
+            ent_ops, n_ops = 0.0, 0
+            for m in model.modules():
+                if isinstance(m, NexusKANLayer):
+                    probs = torch.softmax(m.logits / m.tau, dim=-1)
+                    ent_ops += (-(probs * torch.log(probs + 1e-8)).sum(dim=-1)).mean()
+                    n_ops += 1
+            ent_avg = ent_ops / n_ops if n_ops > 0 else 0.0
+
+            # L1 on spline activation scales
+            l1_acts = sum(a.abs().sum() for a in model.kan.acts_scale_spline)
+            n_acts  = max(len(model.kan.acts_scale_spline), 1)
+
+            total = loss + lamb_ent * ent_avg + 1e-4 * l1_acts / n_acts
+            optimizer.zero_grad()
+            total.backward()
+            optimizer.step()
+
+    # Final forward to populate acts (needed for plot_nexus_network)
+    model.kan.save_act = True
+    with torch.no_grad():
+        model.kan(ds['test_input'])
+
+
+def scenario_e():
+    print('\n=== Scenario E: Hybrid regression  (sin(2pi x0)*sin(2pi x1)) ===')
+    print('    Architecture: NexusKAN([2,4,4]) + FC([4->8->4->1])')
+    torch.manual_seed(4); np.random.seed(4)
+
+    x = torch.rand(N_TRAIN + N_TEST, 2)
+    y = (torch.sin(2 * math.pi * x[:, 0]) * torch.sin(2 * math.pi * x[:, 1])).unsqueeze(1)
+    ds = {
+        'train_input': x[:N_TRAIN].to(device),
+        'train_label': y[:N_TRAIN].to(device),
+        'test_input':  x[N_TRAIN:].to(device),
+        'test_label':  y[N_TRAIN:].to(device),
+    }
+
+    model = _NexusKANMultiFC(n_inputs=2, h_kan=4, h_fc=8, seed=4).to(device)
+    _train_hybrid_regression(model, ds, epochs=EPOCHS_HYB)
+
+    with torch.no_grad():
+        pred = model(ds['test_input'])
+        r2 = 1 - ((pred - ds['test_label'])**2).mean().item() / ds['test_label'].var().item()
+    print(f'  Test R2: {r2:.4f}')
+
+    stem = 'hybrid_sine_product'
+
+    # # 1. KAN+FC architecture flow diagram (new visualization)
+    # plot_kan_fc_architecture(
+    #     model.kan, model.fc,
+    #     in_vars=['x0', 'x1'],
+    #     out_vars=['y'],
+    #     title='Hybrid: sin(2pi x0)*sin(2pi x1)  --  KAN+FC architecture',
+    #     scale=0.9,
+    #     save_path=os.path.join(OUT_DIR, f'{stem}_arch.png'),
+    # )
+
+    # 2. KAN+FC network diagram
+    plot_nexus_network(
+        model.kan, fc_module=model.fc, metric='forward_n', scale=0.7,
+        in_vars=['x0', 'x1'], out_vars=['y'],
+        title='Hybrid: sin(2pi x0)*sin(2pi x1)  --  KAN+FC network',
+        save_path=os.path.join(OUT_DIR, f'{stem}_network.png'),
+    )
+
+    # 3. Operation probability heatmap
+    plot_ops_heatmap(
+        model.kan,
+        title='Hybrid sine product - KAN operation probabilities',
+        save_path=os.path.join(OUT_DIR, f'{stem}_ops.png'),
+    )
+
+    # 4. Activation gallery
+    plot_activation_gallery(
+        model.kan,
+        title='Hybrid sine product - KAN B-spline activations',
         save_path=os.path.join(OUT_DIR, f'{stem}_splines.png'),
     )
 
@@ -389,10 +532,11 @@ if __name__ == '__main__':
     print(f'Device: {device}')
     print(f'Output directory: {OUT_DIR}')
 
-    scenario_a()
-    scenario_b()
-    scenario_c()
+    # scenario_a()
+    # scenario_b()
+    # scenario_c()
     scenario_d()
+    # scenario_e()
 
     print(f'\nAll figures written to {OUT_DIR}/')
     for f in sorted(os.listdir(OUT_DIR)):
