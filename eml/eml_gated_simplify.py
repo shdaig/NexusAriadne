@@ -9,16 +9,17 @@ Binary tree of gated nodes:
 
     eml(u, v)  = exp(u) - ln(v)
 
-Each node additionally has a swap gate (gamma) applied to its inputs
-before the alpha gate, so the tree can orient (u, v) freely at every
-level — not just at leaves.  This is necessary because eml is
-non-commutative: only eml(1, M) = ln(x), not eml(M, 1).
+Leaves: pair 0 = (1, x), all other pairs = (1, 1).
+x is fixed as the second (V) operand of the first leaf — the network
+learns which internal node should receive it via the alpha gates alone.
+There are no swap gates: eml is non-commutative, so fixing x in the V
+slot biases the tree toward the correct orientation for ln(x).
 
-All logits (alpha, gamma) init to 0  →  sigmoid(0 / tau) = 0.5:
+All alpha logits init with small Gaussian noise → sigmoid ≈ 0.5:
 no bias toward either choice.  Temperature tau anneals from tau_start
 to tau_end across epochs, sharpening decisions.  Lambda on the binary
-entropy of each gate grows across epochs, mimicking the NexusKAN
-entropy schedule that drives gates toward hard {0, 1} decisions.
+entropy of each alpha grows across epochs, driving gates toward hard
+{0, 1} decisions.
 
 Target: ln(x).   Known EML form: eml(1, eml(eml(1, x), 1)).
 """
@@ -77,31 +78,32 @@ def get_lam_ent(epoch: int, epochs: int, lam_start: float = 1e-4, lam_end: float
 
 class GatedEMLTree(nn.Module):
     """
-    Full binary tree of depth D.
-    Leaves: pair 0 = (x, 1), all other pairs = (1, 1).
+    Full binary tree of depth D with 2^(depth-1) leaf pairs.
 
-    At every level each node has:
-      - gamma logit: soft swap of (U, V) before the gate
-      - alpha logit: mult vs eml gate on the (possibly swapped) inputs
+    Leaf layout (interleaved, flat index k = 0 .. 2n-1):
+        k even  →  U-slot of pair k//2
+        k odd   →  V-slot of pair k//2
 
-    All logits init to 0 → sigmoid(0/tau) = 0.5 (unbiased).
+    phi (size 2n = 2^depth): softmax over all 2n leaf cells.
+    The cell with the highest weight receives x; all others receive 1.
+    x can therefore land in any U or V slot of any pair.
+
+    Each internal node has one alpha logit: sigmoid→1 means multiply,
+    sigmoid→0 means eml.
     """
 
     def __init__(self, depth: int = 3, init_noise: float = 1.0):
         super().__init__()
         self.depth = depth
+        n = 2 ** (depth - 1)
 
         # Level l ∈ [1..depth] has 2^(depth-l) nodes.
-        # Logits are initialized with zero-mean Gaussian noise (unbiased on
-        # average, but breaks the saddle at exactly 0.5 for every gate).
-        self.alphas = nn.ParameterList([   # eml vs mult gate
+        self.alphas = nn.ParameterList([
             nn.Parameter(torch.randn(2 ** (depth - l)) * init_noise)
             for l in range(1, depth + 1)
         ])
-        self.gammas = nn.ParameterList([   # swap gate (per node, every level)
-            nn.Parameter(torch.randn(2 ** (depth - l)) * init_noise)
-            for l in range(1, depth + 1)
-        ])
+        # Softmax over all 2n leaf cells (U and V slots of every pair)
+        self.phi = nn.Parameter(torch.randn(2 * n) * init_noise)
 
     # ------------------------------------------------------------------
 
@@ -111,22 +113,18 @@ class GatedEMLTree(nn.Module):
         Returns complex128 tensor, shape (B,)
         """
         B = x.shape[0]
-        n = 2 ** (self.depth - 1)
-        dev = x.device
 
-        U = torch.ones(B, n, dtype=torch.complex128, device=dev)
-        V = torch.ones(B, n, dtype=torch.complex128, device=dev)
-        U[:, 0] = x
+        # soft_pos[k]: weight for flat leaf cell k (even→U slot, odd→V slot).
+        # leaf_k = soft_pos[k]*x + (1 - soft_pos[k])*1  →  x where weight≈1, else 1.
+        soft_pos = torch.softmax(self.phi / tau, dim=0).to(torch.complex128)  # (2n,)
+        leaves = soft_pos.unsqueeze(0) * x.unsqueeze(1) + (1.0 - soft_pos.unsqueeze(0))
+        U = leaves[:, 0::2]  # even indices → U slots, shape (B, n)
+        V = leaves[:, 1::2]  # odd  indices → V slots, shape (B, n)
 
         for level_idx in range(self.depth):
-            # Soft swap of (U, V) inputs at each node
-            g = torch.sigmoid(self.gammas[level_idx] / tau).to(torch.complex128).unsqueeze(0)
-            U_s = g * U + (1.0 - g) * V
-            V_s = (1.0 - g) * U + g * V
-
             # Gated eml vs mult
             a = torch.sigmoid(self.alphas[level_idx] / tau).to(torch.complex128).unsqueeze(0)
-            O = a * (U_s * V_s) + (1.0 - a) * safe_eml(U_s, V_s)
+            O = a * (U * V) + (1.0 - a) * safe_eml(U, V)
 
             if level_idx < self.depth - 1:
                 O = O.view(B, O.shape[1] // 2, 2)
@@ -137,26 +135,28 @@ class GatedEMLTree(nn.Module):
     # ------------------------------------------------------------------
 
     def gate_entropy(self, tau: float) -> torch.Tensor:
-        """Sum of binary entropies of all gate probabilities."""
+        """Sum of binary entropies of alpha gates plus categorical entropy of phi."""
         eps = 1e-8
 
         def bce(p: torch.Tensor) -> torch.Tensor:
             return -(p * torch.log(p + eps) + (1 - p) * torch.log(1 - p + eps))
 
         total = torch.zeros(1)
-        for a, g in zip(self.alphas, self.gammas):
+        for a in self.alphas:
             total = total + bce(torch.sigmoid(a / tau)).mean()
-            total = total + bce(torch.sigmoid(g / tau)).mean()
+        # Categorical entropy of the x-position softmax (minimize → concentrate on one slot)
+        p_pos = torch.softmax(self.phi / tau, dim=0)
+        total = total + -(p_pos * torch.log(p_pos + eps)).sum()
         return total
 
     def gate_probs(self, tau: float) -> dict[str, list]:
         """Readable gate probabilities for display."""
         out = {}
-        for i, (a, g) in enumerate(zip(self.alphas, self.gammas)):
+        for i, a in enumerate(self.alphas):
             pa = [f"{v:.3f}" for v in torch.sigmoid(a / tau).detach().cpu().tolist()]
-            pg = [f"{v:.3f}" for v in torch.sigmoid(g / tau).detach().cpu().tolist()]
             out[f"level {i + 1} alpha (mult)"] = pa
-            out[f"level {i + 1} gamma (keep)"] = pg
+        pp = [f"{v:.3f}" for v in torch.softmax(self.phi / tau, dim=0).detach().cpu().tolist()]
+        out["phi (x position)"] = pp
         return out
 
 
@@ -172,19 +172,21 @@ def snap_tree(model: GatedEMLTree, threshold: float = 0.5) -> str:
         return (torch.sigmoid(param).detach().cpu() > threshold).int().tolist()
 
     alphas_h = [hard(a) for a in model.alphas]
-    gammas_h = [hard(g) for g in model.gammas]
 
     n = 2 ** (depth - 1)
-    # Leaves: pair 0 = (x, 1), rest = (1, 1)
-    U_syms = ["x"] + ["1"] * (n - 1)
+    # phi has 2n entries (even→U, odd→V); argmax picks the leaf that receives x
+    x_cell = int(model.phi.detach().cpu().argmax().item())
+    U_syms = ["1"] * n
     V_syms = ["1"] * n
+    if x_cell % 2 == 0:
+        U_syms[x_cell // 2] = "x"
+    else:
+        V_syms[x_cell // 2] = "x"
 
-    # Level-1 gamma applies first (leaf-pair level)
+    # Level 1: leaf pairs
     symbols = []
     for i in range(n):
         u, v = U_syms[i], V_syms[i]
-        if gammas_h[0][i] == 0:    # gamma=0 means swap
-            u, v = v, u
         if alphas_h[0][i] == 1:    # mult
             if u == "1":   expr = v
             elif v == "1": expr = u
@@ -195,12 +197,9 @@ def snap_tree(model: GatedEMLTree, threshold: float = 0.5) -> str:
 
     # Levels 2..depth
     for l in range(1, depth):
-        # Pair up adjacent symbols into (U, V) for this level
         pairs = [(symbols[i], symbols[i + 1]) for i in range(0, len(symbols), 2)]
         new_syms = []
         for i, (u, v) in enumerate(pairs):
-            if gammas_h[l][i] == 0:   # swap
-                u, v = v, u
             if alphas_h[l][i] == 1:   # mult
                 if u == "1":   expr = v
                 elif v == "1": expr = u
@@ -219,14 +218,15 @@ def evaluate_snapped(model: GatedEMLTree, x: torch.Tensor, y: torch.Tensor,
     with torch.no_grad():
         hard = GatedEMLTree(depth=model.depth)
         for i in range(model.depth):
-            for src_list, dst_list in [
-                (model.alphas, hard.alphas),
-                (model.gammas, hard.gammas),
-            ]:
-                v = (torch.sigmoid(src_list[i]) > threshold).float()
-                dst_list[i].data = torch.where(v > 0.5,
-                                               torch.full_like(v, 20.0),
-                                               torch.full_like(v, -20.0))
+            v = (torch.sigmoid(model.alphas[i]) > threshold).float()
+            hard.alphas[i].data = torch.where(v > 0.5,
+                                              torch.full_like(v, 20.0),
+                                              torch.full_like(v, -20.0))
+        # Snap phi: one-hot at argmax cell
+        x_cell = int(model.phi.detach().cpu().argmax().item())
+        hard_phi = torch.full_like(model.phi, -100.0)
+        hard_phi[x_cell] = 100.0
+        hard.phi.data = hard_phi
         y_pred = hard(x, tau=0.01)
         return ((y_pred.real - y.real) ** 2).mean().item()
 
@@ -248,112 +248,68 @@ def make_data(n: int = 300, x_lo: float = 0.2, x_hi: float = 5.0):
 
 def train(
     depth: int = 3,
-    # Phase 1: MSE exploration — soft gates, high tau, no entropy pressure
-    phase1_epochs: int = 500,
-    tau1_start: float = 2.0,
-    tau1_end: float = 1.0,
-    lr1_start: float = 1.0,
-    lr1_end: float = 1e-3,
-    # Phase 2: MSE + entropy sharpening, tau falls to 0.05
-    phase2_epochs: int = 700,
-    tau2_start: float = 1.0,
-    tau2_end: float = 0.05,
-    lr2_start: float = 3e-3,
-    lr2_end: float = 5e-5,
-    lam_ent_start: float = 1e-4,
+    epochs: int = 1200,
+    n_data: int = 1000,
+    batch_size: int = 64,
+    tau_start: float = 2.0,
+    tau_end: float = 2.0,
+    lr_start: float = 1e-1,
+    lr_end: float = 1e-1,
+    lam_ent_start: float = 1e-10,
     lam_ent_end: float = 1e-1,
     log_every: int = 50,
 ) -> None:
-    """
-    Two-phase training, loss mapped across all epochs.
-
-    Phase 1 — MSE only, tau anneals 5 → 1: free exploration without
-               any gate commitment pressure.
-    Phase 2 — MSE + growing entropy penalty (lam 1e-4 → 1e-1), tau
-               falls to 0.05 so sigmoid(alpha/tau) ≈ step(alpha).
-               Gates sharpen toward hard {0,1} decisions while the MSE
-               gradient keeps guiding which way they snap.
-    """
-    x, y = make_data()
+    x, y = make_data(n=n_data)
     model = GatedEMLTree(depth=depth)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr1_start)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr_start)
 
-    history = {"mse": [], "loss": [], "tau": [], "lam": [], "expr": []}
-    total_epochs = phase1_epochs + phase2_epochs
+    history: dict[str, list] = {"mse": [], "loss": [], "expr": []}
 
-    def _step(epoch_global: int, tau: float, lr: float,
-               mse_val: float, lam: float) -> None:
-        expr = snap_tree(model)
-        history["expr"].append((epoch_global + 1, expr))
-        print(
-            f"epoch {epoch_global+1:5d}/{total_epochs}"
-            f"  tau={tau:.4f}"
-            f"  lr={lr:.2e}"
-            f"  mse={mse_val:.3e}"
-            f"  lam={lam:.2e}"
-            f"  snap: {expr}"
-        )
-
-    # ---- Phase 1 ----
-    print(f"Phase 1 ({phase1_epochs} epochs)  MSE only, tau {tau1_start} → {tau1_end}")
-    for epoch in range(phase1_epochs):
-        tau = get_tau(epoch, phase1_epochs, tau1_start, tau1_end)
-        lr  = get_lr(epoch, phase1_epochs, lr1_start, lr1_end)
+    for epoch in range(epochs):
+        tau = get_tau(epoch, epochs, tau_start, tau_end)
+        lr  = get_lr(epoch, epochs, lr_start, lr_end)
+        lam = 0  # get_lam_ent(epoch, epochs, lam_ent_start, lam_ent_end)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
-        optimizer.zero_grad()
-        y_pred = model(x, tau=tau)
-        mse = ((y_pred.real - y.real) ** 2).mean() + 0.01 * (y_pred.imag ** 2).mean()
+        perm = torch.randperm(len(x))
+        epoch_mse = epoch_loss = 0.0
+        n_batches = 0
+        for start in range(0, len(x), batch_size):
+            idx = perm[start:start + batch_size]
+            xb, yb = x[idx], y[idx]
 
-        if torch.isfinite(mse):
-            mse.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
-            optimizer.step()
+            optimizer.zero_grad()
+            y_pred = model(xb, tau=tau)
+            mse  = ((y_pred.real - yb.real) ** 2).mean() + 0.01 * (y_pred.imag ** 2).mean()
+            loss = mse + lam * model.gate_entropy(tau)
 
-        mse_val = mse.item() if torch.isfinite(mse) else float("nan")
-        history["mse"].append(mse_val)
-        history["loss"].append(mse_val)
-        history["tau"].append(tau)
-        history["lam"].append(0.0)
+            if torch.isfinite(loss):
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
+                optimizer.step()
 
-        if (epoch + 1) % log_every == 0 or epoch == phase1_epochs - 1:
-            _step(epoch, tau, lr, mse_val, 0.0)
+            epoch_mse  += mse.item()  if torch.isfinite(mse)  else float("nan")
+            epoch_loss += loss.item() if torch.isfinite(loss) else float("nan")
+            n_batches  += 1
 
-    # ---- Phase 2 ----
-    print(f"\nPhase 2 ({phase2_epochs} epochs)  tau {tau2_start} → {tau2_end}  "
-          f"lam_ent {lam_ent_start:.0e} → {lam_ent_end:.0e}")
-    for epoch in range(phase2_epochs):
-        g = phase1_epochs + epoch
-        tau = get_tau(epoch, phase2_epochs, tau2_start, tau2_end)
-        lr  = get_lr(epoch, phase2_epochs, lr2_start, lr2_end)
-        lam = get_lam_ent(epoch, phase2_epochs, lam_ent_start, lam_ent_end)
-        for pg in optimizer.param_groups:
-            pg["lr"] = lr
-
-        optimizer.zero_grad()
-        y_pred = model(x, tau=tau)
-        mse = ((y_pred.real - y.real) ** 2).mean() + 0.01 * (y_pred.imag ** 2).mean()
-        ent = model.gate_entropy(tau)
-        loss = mse + lam * ent
-
-        if torch.isfinite(loss):
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
-            optimizer.step()
-
-        mse_val  = mse.item() if torch.isfinite(mse) else float("nan")
-        loss_val = loss.item() if torch.isfinite(loss) else float("nan")
+        mse_val  = epoch_mse  / n_batches
+        loss_val = epoch_loss / n_batches
         history["mse"].append(mse_val)
         history["loss"].append(loss_val)
-        history["tau"].append(tau)
-        history["lam"].append(lam)
 
-        if (epoch + 1) % log_every == 0 or epoch == phase2_epochs - 1:
-            _step(g, tau, lr, mse_val, lam)
+        if (epoch + 1) % log_every == 0 or epoch == epochs - 1:
+            expr = snap_tree(model)
+            history["expr"].append((epoch + 1, expr))
+            print(
+                f"epoch {epoch+1:5d}/{epochs}"
+                f"  tau={tau:.4f}"
+                f"  lr={lr:.2e}"
+                f"  mse={mse_val:.3e}"
+                f"  lam={lam:.2e}"
+                f"  snap: {expr}"
+            )
 
-    # ------------------------------------------------------------------
-    # Final report
     # ------------------------------------------------------------------
     print("\n" + "=" * 70)
     final_expr  = snap_tree(model)
@@ -363,7 +319,7 @@ def train(
     print(f"Soft MSE (last epoch)    : {history['mse'][-1]:.4e}")
     print()
     print("Gate probabilities (final tau):")
-    for key, vals in model.gate_probs(tau=tau2_end).items():
+    for key, vals in model.gate_probs(tau=tau_end).items():
         print(f"  {key}: {vals}")
     print("=" * 70)
 
