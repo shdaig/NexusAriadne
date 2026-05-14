@@ -56,7 +56,7 @@ TAU_START   = 2.0
 TAU_END     = 0.1
 LAMB_START  = 1e-2
 LAMB_END    = 10.0
-LAMB_L1_ACTS  = 1e-2   # L1 regularization on acts_scale_spline
+LAMB_L1_ACTS  = 1e-3   # L1 regularization on acts_scale_spline
 LAMB_ENT_ACTS = 1e-3   # entropy regularization on acts_scale_spline
 N_TRAIN     = 800
 N_TEST      = 200
@@ -534,8 +534,8 @@ if __name__ == '__main__':
 
     # scenario_a()
     # scenario_b()
-    # scenario_c()
-    scenario_d()
+    scenario_c()
+    # scenario_d()
     # scenario_e()
 
     print(f'\nAll figures written to {OUT_DIR}/')

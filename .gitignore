@@ -4,3 +4,4 @@ __pycache__/
 model/
 figures/
 outputs/
+local_*/
