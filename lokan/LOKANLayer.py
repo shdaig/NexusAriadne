@@ -211,7 +211,13 @@ class LOKANLayer(nn.Module):
         # Summation path
         y_sum  = torch.sum(y * sum_probs, dim=1)                             # (batch, out_dim)
 
-        y = y_sum + torch.sum(y_prod, dim=2)                                 # (batch, out_dim)
+        # beta_g = torch.prod(1 - prod_probs, dim=1) # (1, out_dim, K)
+        # y = y_sum + torch.sum(y_prod - beta_g, dim=2) # (batch, out_dim)
+        
+        w_g = 1 - torch.prod(1 - prod_probs, dim=1) # (1, out_dim, K)
+        y = y_sum + torch.sum(w_g * y_prod, dim=2)
+        
+        # y = y_sum + torch.sum(y_prod, dim=2) # (batch, out_dim)v
 
         return y, preacts, postacts, postspline
 

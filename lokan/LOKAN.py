@@ -986,16 +986,24 @@ class LOKAN(nn.Module):
                         else:
                             print(f'({l},{i},{j}): best={name}, r2={r2:.4f} < {r2_threshold} — skipped')
 
-    def symbolic_formula(self, var=None, normalizer=None, output_normalizer=None, simplify=False):
+    def symbolic_formula(self, var=None, normalizer=None, output_normalizer=None,
+                         simplify=False, tau_decode=0.05):
         """
         Extract the closed-form symbolic expression of the network.
 
         Requires that all active edges have been fixed to symbolic functions
         (via ``fix_symbolic`` or ``auto_symbolic``).
 
-        The learnable operation logits affect *numerical* computation only;
-        this method reads the *symbolic front-end* (``Symbolic_KANLayer``)
-        and returns a pure sympy expression.
+        Respects LOKAN's learnable operation routing: after decoding the
+        dominant group assignment from ``logits`` (via argmax at temperature
+        ``tau_decode``), edges assigned to the summation group are summed
+        while edges assigned to a multiplicative group are multiplied together.
+        This matches the actual forward-pass aggregation:
+
+            z_j = Σ_{i∈sum} φ_ij(x_i)  +  Σ_g Π_{i∈group_g} φ_ij(x_i)
+
+        After calling this method the per-edge and per-node symbolic
+        expressions are available via ``get_sym_edge`` and ``get_sym_node``.
 
         Parameters
         ----------
@@ -1008,6 +1016,9 @@ class LOKAN(nn.Module):
             If provided, outputs are de-normalised as ``y * std + mean``.
         simplify : bool
             Apply ``sympy.simplify`` to each output expression.
+        tau_decode : float
+            Softmax temperature used for hard group assignment (argmax).
+            Lower values → sharper, closer to discrete assignment.
 
         Returns
         -------
@@ -1023,22 +1034,19 @@ class LOKAN(nn.Module):
 
         Example
         -------
-        >>> model = LOKAN(width=[2, 1, 1], grid=5, k=3, seed=0)
+        >>> model = LOKAN(width=[2, 2, 1], grid=5, k=3, seed=0)
         >>> x = torch.rand(200, 2)
         >>> model(x)
         >>> model.auto_symbolic()
-        >>> exprs, syms = model.symbolic_formula()
+        >>> exprs, syms = model.symbolic_formula(tau_decode=0.05)
         >>> exprs[0]
+        >>> model.get_sym_node(1, 0)   # hidden node 0 after layer 0
+        >>> model.get_sym_edge(0, 0, 1)  # edge (input 0 → hidden 1), layer 0
         """
-        symbolic_acts = []
-        x = []
-
         if var is None:
-            for ii in range(1, self.width[0][0] + 1):
-                exec(f"x{ii} = sympy.Symbol('x_{ii}')")
-                exec(f"x.append(x{ii})")
+            x = [sympy.Symbol(f'x_{ii}') for ii in range(1, self.width[0][0] + 1)]
         elif isinstance(var[0], sympy.Expr):
-            x = var
+            x = list(var)
         else:
             x = [sympy.symbols(v) for v in var]
 
@@ -1048,39 +1056,147 @@ class LOKAN(nn.Module):
             mean, std = normalizer
             x = [(x[i] - mean[i]) / std[i] for i in range(len(x))]
 
-        symbolic_acts.append(x)
+        # sym_expr_edges[l][j][i] = sympy expr for edge (i→j) in layer l, or None if dead
+        # sym_expr_nodes[l][j]    = combined sympy expr for node j at depth l
+        self.sym_expr_edges = []
+        self.sym_expr_nodes = [list(x)]   # depth 0 = raw input symbols
 
         for l in range(len(self.width_in) - 1):
-            y = []
-            for j in range(self.width_out[l + 1]):
-                yj = sympy.Integer(0)
-                for i in range(self.width_in[l]):
-                    a, b, c, d = self.symbolic_fun[l].affine[j, i]
-                    sympy_fun  = self.symbolic_fun[l].funs_sympy[j][i]
-                    try:
-                        yj = yj + c * sympy_fun(a * x[i] + b) + d
-                    except Exception:
+            layer     = self.act_fun[l]       # LOKANLayer
+            sym_layer = self.symbolic_fun[l]  # Symbolic_KANLayer
+            in_dim    = self.width_in[l]
+            out_dim   = self.width_out[l + 1]
+
+            # Total logit slots G = in_dim // 2 + 1;
+            # groups 0..K-1 are multiplicative, group K (last) is summation.
+            G = layer.logits.shape[-1]
+            K = G - 1  # number of multiplicative groups
+
+            # Hard group assignment via argmax at decode temperature
+            with torch.no_grad():
+                probs        = torch.softmax(layer.logits / tau_decode, dim=-1)  # (in_dim, out_dim, G)
+                group_assign = torch.argmax(probs, dim=-1)                        # (in_dim, out_dim)
+
+            # Build per-edge symbolic expressions
+            edge_exprs = [[None] * in_dim for _ in range(out_dim)]  # [j][i]
+            for j in range(out_dim):
+                for i in range(in_dim):
+                    sym_active = sym_layer.mask[j, i].item() != 0
+                    num_active = layer.mask[i, j].item() != 0
+                    if not sym_active and not num_active:
+                        edge_exprs[j][i] = None  # dead edge
+                        continue
+                    if not sym_active and num_active:
                         raise RuntimeError(
-                            f'Edge ({l},{i},{j}) is not symbolic. '
+                            f'Edge ({l},{i},{j}) is still in numerical mode. '
                             'Run auto_symbolic() or fix_symbolic() first.'
                         )
+                    a, b, c, d = sym_layer.affine[j, i]
+                    sympy_fun  = sym_layer.funs_sympy[j][i]
+                    try:
+                        edge_exprs[j][i] = c * sympy_fun(a * x[i] + b) + d
+                    except Exception:
+                        raise RuntimeError(
+                            f'Edge ({l},{i},{j}) failed symbolic evaluation. '
+                            'Run auto_symbolic() or fix_symbolic() first.'
+                        )
+
+            self.sym_expr_edges.append(edge_exprs)
+
+            # Build per-node expressions using LOKAN's operation routing
+            y = []
+            for j in range(out_dim):
+                sum_edges  = []
+                mult_groups = {g: [] for g in range(K)}
+
+                for i in range(in_dim):
+                    expr = edge_exprs[j][i]
+                    if expr is None:
+                        continue
+                    g = int(group_assign[i, j].item())
+                    if g == K:                   # summation group (last slot)
+                        sum_edges.append(expr)
+                    else:                         # multiplicative group g
+                        mult_groups[g].append(expr)
+
+                # Sum path
+                yj = sympy.Integer(0)
+                for expr in sum_edges:
+                    yj = yj + expr
+
+                # Multiplicative groups — empty groups contribute 0 (matches w_g fix)
+                for g in range(K):
+                    group = mult_groups[g]
+                    if not group:
+                        continue
+                    prod_g = group[0]
+                    for expr in group[1:]:
+                        prod_g = prod_g * expr
+                    yj = yj + prod_g
+
                 yj = self.subnode_scale[l][j] * yj + self.subnode_bias[l][j]
                 y.append(sympy.simplify(yj) if simplify else yj)
 
             for j in range(self.width_in[l + 1]):
                 y[j] = self.node_scale[l][j] * y[j] + self.node_bias[l][j]
 
+            self.sym_expr_nodes.append(y)
             x = y
-            symbolic_acts.append(x)
 
         if output_normalizer is not None:
-            means, stds = output_normalizer
-            out_layer   = symbolic_acts[-1]
+            means, stds   = output_normalizer
+            out_layer     = self.sym_expr_nodes[-1]
             assert len(out_layer) == len(means), 'output_normalizer size mismatch'
-            symbolic_acts[-1] = [out_layer[i] * stds[i] + means[i] for i in range(len(out_layer))]
+            self.sym_expr_nodes[-1] = [out_layer[i] * stds[i] + means[i] for i in range(len(out_layer))]
 
-        self.symbolic_acts = symbolic_acts
-        return [symbolic_acts[-1][i] for i in range(len(symbolic_acts[-1]))], x0
+        self.symbolic_acts = self.sym_expr_nodes  # backwards compat
+        return list(self.sym_expr_nodes[-1]), x0
+
+    def get_sym_edge(self, l, i, j):
+        """
+        Return the symbolic expression for edge (i→j) in layer *l*.
+
+        Call ``symbolic_formula()`` first to populate the cache.
+
+        Parameters
+        ----------
+        l : int
+            Layer index (0-based).
+        i : int
+            Input neuron index.
+        j : int
+            Output neuron index.
+
+        Returns
+        -------
+        sympy.Expr or None
+            The symbolic expression, or ``None`` for dead edges.
+        """
+        return self.sym_expr_edges[l][j][i]
+
+    def get_sym_node(self, l, j):
+        """
+        Return the symbolic expression for node *j* at depth *l*.
+
+        Depth 0 = raw input variables; depth L = network outputs.
+        Useful for reading out sub-expressions at any hidden layer,
+        especially when the LOKAN block has multiple outputs.
+
+        Call ``symbolic_formula()`` first to populate the cache.
+
+        Parameters
+        ----------
+        l : int
+            Depth index (0 = input layer, L = output layer).
+        j : int
+            Node index within depth *l*.
+
+        Returns
+        -------
+        sympy.Expr
+            The symbolic expression at node (l, j).
+        """
+        return self.sym_expr_nodes[l][j]
 
     # ------------------------------------------------------------------
     # Visualization
