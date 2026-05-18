@@ -836,6 +836,215 @@ class LOKAN(nn.Module):
         return old_save_act, old_symbolic_enabled
 
     # ------------------------------------------------------------------
+    # Pruning
+    # ------------------------------------------------------------------
+
+    def remove_edge(self, l, i, j):
+        """
+        Kill the (l, i→j) edge by zeroing both numerical and symbolic masks.
+
+        Parameters
+        ----------
+        l : int
+            Layer index.
+        i : int
+            Input neuron index.
+        j : int
+            Output neuron index.
+        """
+        self.act_fun[l].mask.data[i, j]      = 0.
+        self.symbolic_fun[l].mask.data[j, i] = 0.
+
+    def remove_node(self, l, i, mode='all'):
+        """
+        Kill node (l, i) by zeroing the masks of all incoming and/or
+        outgoing edges.
+
+        Parameters
+        ----------
+        l : int
+            Layer index of the node.
+        i : int
+            Neuron index within layer l.
+        mode : str
+            ``'up'``   — zero all outgoing edges (acts going forward).
+            ``'down'`` — zero all incoming edges (acts coming in).
+            ``'all'``  — zero both directions (default).
+        """
+        if mode in ('up', 'all'):
+            self.act_fun[l].mask.data[i, :]       = 0.
+            self.symbolic_fun[l].mask.data[:, i]  = 0.
+        if mode in ('down', 'all'):
+            self.act_fun[l - 1].mask.data[:, i]      = 0.
+            self.symbolic_fun[l - 1].mask.data[i, :] = 0.
+
+    def prune_edge(self, threshold=3e-2):
+        """
+        Zero edges whose attribution score falls below *threshold* (in-place).
+
+        Both numerical and symbolic masks are updated so that
+        ``symbolic_formula()`` stays consistent.
+
+        Parameters
+        ----------
+        threshold : float
+            Edges with ``edge_scores[l][j, i] <= threshold`` are killed.
+
+        Example
+        -------
+        >>> model.save_act = True
+        >>> model(x)
+        >>> model.prune_edge(threshold=0.03)
+        """
+        if self.acts is None:
+            self.save_act = True
+            self.forward(self.cache_data)
+        self.attribute()
+
+        for l in range(self.depth):
+            old_mask = self.act_fun[l].mask.data                          # (in_dim, out_dim)
+            active   = (self.edge_scores[l].T > threshold).float()        # (in_dim, out_dim)
+            new_mask = active * old_mask
+            self.act_fun[l].mask.data      = new_mask
+            # Kill symbolic mask wherever the numerical edge is now dead
+            self.symbolic_fun[l].mask.data *= (new_mask.T > 0).float()   # (out_dim, in_dim)
+
+    def prune_node(self, threshold=1e-2, mode='auto', active_neurons_id=None):
+        """
+        Return a new, structurally smaller LOKAN with dead hidden nodes removed.
+
+        Input and output layers are never pruned. For each hidden layer the
+        node attribution scores from ``attribute()`` decide which neurons
+        survive. Logit tensors are properly resized so that
+        ``G = in_dim // 2 + 1`` holds in every layer of the pruned model.
+
+        Parameters
+        ----------
+        threshold : float
+            Nodes with ``node_scores[l][j] <= threshold`` are removed.
+            Only used when ``mode='auto'``.
+        mode : str
+            ``'auto'``   — prune by attribution threshold (default).
+            ``'manual'`` — keep exactly the neurons in *active_neurons_id*.
+        active_neurons_id : list of list of int or None
+            Required when ``mode='manual'``.  One list per hidden layer
+            (not including input or output layers), e.g.
+            ``[[0, 2], [0]]`` for a 3-layer network.
+
+        Returns
+        -------
+        LOKAN
+            A new pruned model; the original is unchanged.
+
+        Example
+        -------
+        >>> model.save_act = True
+        >>> model(x)
+        >>> model2 = model.prune_node(threshold=0.01)
+        >>> print(model.width, '→', model2.width)
+        """
+        if self.acts is None:
+            self.save_act = True
+            self.forward(self.cache_data)
+
+        if mode == 'auto':
+            self.attribute()
+
+        # Determine surviving neurons per layer
+        active_neurons = [list(range(self.width_in[0]))]   # inputs: always keep all
+
+        for l in range(1, self.depth):                      # hidden layers only
+            if mode == 'auto':
+                scores    = self.node_scores[l]             # shape (width_in[l],)
+                keep_mask = scores > threshold
+                keep_idx  = torch.where(keep_mask)[0].tolist()
+            else:
+                keep_idx = list(active_neurons_id[l - 1])
+            # Always keep at least one neuron to avoid empty layers
+            if len(keep_idx) == 0:
+                keep_idx = [int(torch.argmax(self.node_scores[l]).item())]
+            active_neurons.append(keep_idx)
+
+        active_neurons.append(list(range(self.width_out[-1])))  # outputs: always keep all
+
+        # Build new width (plain ints — LOKAN always uses [n, 0])
+        new_width = [len(a) for a in active_neurons]
+
+        # Create new model with correct topology
+        model2 = LOKAN(
+            width=new_width,
+            grid=self.grid,
+            k=self.k,
+            base_fun=self.base_fun_name,
+            symbolic_enabled=self.symbolic_enabled,
+            affine_trainable=self.affine_trainable,
+            sp_trainable=self.sp_trainable,
+            sb_trainable=self.sb_trainable,
+            grid_eps=self.grid_eps,
+            grid_range=self.grid_range,
+            save_act=self.save_act,
+            device=self.device,
+        )
+
+        # Copy trained parameters (sliced to surviving neurons)
+        for l in range(self.depth):
+            in_idx  = torch.tensor(active_neurons[l],     dtype=torch.long)
+            out_idx = torch.tensor(active_neurons[l + 1], dtype=torch.long)
+
+            model2.act_fun[l]      = self.act_fun[l].get_subset(in_idx, out_idx)
+            model2.symbolic_fun[l] = self.symbolic_fun[l].get_subset(in_idx, out_idx)
+
+            model2.node_bias[l].data    = self.node_bias[l].data[out_idx]
+            model2.node_scale[l].data   = self.node_scale[l].data[out_idx]
+            model2.subnode_bias[l].data  = self.subnode_bias[l].data[out_idx]
+            model2.subnode_scale[l].data = self.subnode_scale[l].data[out_idx]
+
+        model2.cache_data = self.cache_data
+        model2.acts       = None
+        model2.input_id   = self.input_id
+        return model2
+
+    def prune(self, node_th=1e-2, edge_th=3e-2):
+        """
+        Prune both nodes and edges and return a new, compacted LOKAN.
+
+        Calls ``prune_node`` first (structural reduction), then runs a
+        forward pass on the pruned model and calls ``prune_edge`` (mask
+        zeroing) on the result.
+
+        Parameters
+        ----------
+        node_th : float
+            Attribution threshold for node pruning.
+        edge_th : float
+            Attribution threshold for edge pruning.
+
+        Returns
+        -------
+        LOKAN
+            Pruned model.
+
+        Example
+        -------
+        >>> model.save_act = True
+        >>> model(x)
+        >>> model2 = model.prune(node_th=0.01, edge_th=0.03)
+        >>> model2.auto_symbolic()
+        >>> exprs, _ = model2.symbolic_formula()
+        """
+        if self.acts is None:
+            self.save_act = True
+            self.forward(self.cache_data)
+
+        model2 = self.prune_node(node_th)
+
+        model2.save_act = True
+        model2.forward(model2.cache_data)
+        model2.attribute()
+        model2.prune_edge(edge_th)
+        return model2
+
+    # ------------------------------------------------------------------
     # Symbolic regression
     # ------------------------------------------------------------------
 

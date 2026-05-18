@@ -267,3 +267,67 @@ class LOKANLayer(nn.Module):
 
         self.grid.data = extend_grid(grid, k_extend=self.k)
         self.coef.data = curve2coef(x_pos, y_eval, self.grid, self.k)
+
+    def get_subset(self, in_indices, out_indices):
+        """
+        Return a new LOKANLayer containing only the selected input/output neurons.
+
+        All trained spline parameters are sliced to the surviving neurons.
+        The logit tensor is resized to match the new ``in_dim``: slots are
+        truncated (or padded) so that ``G_new = new_in // 2 + 1`` while the
+        summation slot (last) is always preserved.
+
+        Parameters
+        ----------
+        in_indices : 1-D LongTensor or list of int
+            Indices of the input neurons to keep.
+        out_indices : 1-D LongTensor or list of int
+            Indices of the output neurons to keep.
+
+        Returns
+        -------
+        LOKANLayer
+            A new layer with ``in_dim = len(in_indices)`` and
+            ``out_dim = len(out_indices)``.
+        """
+        in_indices  = torch.as_tensor(in_indices,  dtype=torch.long)
+        out_indices = torch.as_tensor(out_indices, dtype=torch.long)
+        new_in  = len(in_indices)
+        new_out = len(out_indices)
+
+        layer = LOKANLayer(
+            in_dim=new_in, out_dim=new_out,
+            num=self.num, k=self.k,
+            base_fun=self.base_fun,
+            grid_eps=self.grid_eps,
+            device=self.device,
+        )
+
+        layer.grid.data       = self.grid.data[in_indices, :]
+        layer.coef.data       = self.coef.data[in_indices, :, :][:, out_indices, :]
+        layer.mask.data       = self.mask.data[in_indices, :][:, out_indices]
+        layer.scale_base.data = self.scale_base.data[in_indices, :][:, out_indices]
+        layer.scale_sp.data   = self.scale_sp.data[in_indices, :][:, out_indices]
+
+        # Resize logits so G_new = new_in // 2 + 1 (last slot = summation group)
+        G_old = self.logits.shape[-1]
+        G_new = new_in // 2 + 1
+        logits_sliced = self.logits.data[in_indices, :, :][:, out_indices, :]  # (new_in, new_out, G_old)
+
+        if G_new < G_old:
+            # Truncate: keep first G_new-1 mult-group slots + sum slot (last)
+            logits_new = torch.cat(
+                [logits_sliced[:, :, :G_new - 1], logits_sliced[:, :, -1:]], dim=-1
+            )
+        elif G_new > G_old:
+            # Expand: pad extra mult-group slots with zeros before sum slot
+            pad = torch.zeros(new_in, new_out, G_new - G_old, device=self.device)
+            logits_new = torch.cat(
+                [logits_sliced[:, :, :-1], pad, logits_sliced[:, :, -1:]], dim=-1
+            )
+        else:
+            logits_new = logits_sliced
+
+        layer.logits.data = logits_new
+        layer.tau = self.tau
+        return layer

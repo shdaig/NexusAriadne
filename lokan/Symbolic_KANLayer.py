@@ -210,4 +210,44 @@ class Symbolic_KANLayer(nn.Module):
             else:
                 self.affine.data[j][i] = torch.rand(4, device=self.device) * 2 - 1
             return None
+
+    def get_subset(self, in_indices, out_indices):
+        """
+        Return a new Symbolic_KANLayer containing only the selected neurons.
+
+        All symbolic functions (torch, sympy, names) and affine parameters
+        are copied for the surviving edges so that ``symbolic_formula()``
+        continues to work correctly after pruning.
+
+        Parameters
+        ----------
+        in_indices : 1-D LongTensor or list of int
+            Indices of the input neurons to keep.
+        out_indices : 1-D LongTensor or list of int
+            Indices of the output neurons to keep.
+
+        Returns
+        -------
+        Symbolic_KANLayer
+            A new layer with ``in_dim = len(in_indices)`` and
+            ``out_dim = len(out_indices)``.
+        """
+        in_indices  = [int(i) for i in in_indices]
+        out_indices = [int(j) for j in out_indices]
+
+        new_sym = Symbolic_KANLayer(
+            in_dim=len(in_indices), out_dim=len(out_indices), device=self.device
+        )
+
+        new_sym.mask.data   = self.mask.data[out_indices, :][:, in_indices]
+        new_sym.affine.data = self.affine.data[out_indices, :, :][:, in_indices, :]
+
+        for j_new, j_old in enumerate(out_indices):
+            for i_new, i_old in enumerate(in_indices):
+                new_sym.funs[j_new][i_new]                    = self.funs[j_old][i_old]
+                new_sym.funs_avoid_singularity[j_new][i_new]  = self.funs_avoid_singularity[j_old][i_old]
+                new_sym.funs_sympy[j_new][i_new]              = self.funs_sympy[j_old][i_old]
+                new_sym.funs_name[j_new][i_new]               = self.funs_name[j_old][i_old]
+
+        return new_sym
         
