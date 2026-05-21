@@ -321,6 +321,133 @@ class LOKAN(nn.Module):
         """
         self.update_grid_from_samples(x)
 
+    def initialize_from_another_model(self, source, x):
+        """
+        Initialize *self* from *source* LOKAN of the **same width** but a
+        (typically coarser) grid.
+
+        After the call every spline in *self* represents the same function as
+        the corresponding spline in *source*, re-expressed on *self*'s finer
+        grid.  Non-spline parameters (logits, tau, scales, masks, affine
+        nodes, symbolic layers) are copied directly.
+
+        Parameters
+        ----------
+        source : LOKAN
+            Model to copy from.  Must have identical ``width``.
+        x : torch.Tensor
+            A representative input batch of shape ``(batch, width_in[0])``.
+            Used to evaluate the source network and place grid knots at data
+            quantiles.
+
+        Returns
+        -------
+        LOKAN
+            ``self`` (for chaining).
+
+        Example
+        -------
+        >>> coarse = LOKAN(width=[2, 5, 1], grid=3, k=3, seed=0)
+        >>> fine   = LOKAN(width=[2, 5, 1], grid=10, k=3, seed=0)
+        >>> x = torch.rand(200, 2)
+        >>> fine.initialize_from_another_model(coarse, x)
+        >>> fine.grid
+        10
+        """
+        source.get_act(x)  # populate source.acts, spline_preacts, spline_postsplines
+
+        for l in range(self.depth):
+            # 1. Place new grid knots at data quantiles and do an initial coef fit
+            self.act_fun[l].initialize_grid_from_parent(source.act_fun[l], source.acts[l])
+
+            # 2. Refit coef using all sample points and the raw spline values
+            #    preacts[:, 0, :] = (batch, in_dim) — raw x at this layer
+            #    postsplines.permute(0,2,1) = (batch, in_dim, out_dim)
+            spb         = self.act_fun[l]
+            preacts     = source.spline_preacts[l]      # (batch, out_dim, in_dim)
+            postsplines = source.spline_postsplines[l]  # (batch, out_dim, in_dim)
+            self.act_fun[l].coef.data = curve2coef(
+                preacts[:, 0, :], postsplines.permute(0, 2, 1), spb.grid, k=spb.k
+            )
+
+            # 3. Copy all non-grid parameters
+            self.act_fun[l].scale_base.data = source.act_fun[l].scale_base.data
+            self.act_fun[l].scale_sp.data   = source.act_fun[l].scale_sp.data
+            self.act_fun[l].mask.data       = source.act_fun[l].mask.data
+            self.act_fun[l].logits.data     = source.act_fun[l].logits.data
+            self.act_fun[l].tau             = source.act_fun[l].tau
+
+        for l in range(self.depth):
+            self.node_bias[l].data     = source.node_bias[l].data
+            self.node_scale[l].data    = source.node_scale[l].data
+            self.subnode_bias[l].data  = source.subnode_bias[l].data
+            self.subnode_scale[l].data = source.subnode_scale[l].data
+
+        for l in range(self.depth):
+            self.symbolic_fun[l] = source.symbolic_fun[l]
+
+        return self.to(self.device)
+
+    def refine(self, new_grid):
+        """
+        Return a new LOKAN with ``new_grid`` B-spline intervals, initialized
+        so that every spline represents the same function as in *self*.
+
+        Typical usage is the grid-extension schedule from the KAN paper:
+        train on a coarse grid, refine to a finer one, continue training.
+
+        Parameters
+        ----------
+        new_grid : int
+            Number of B-spline intervals in the new model.
+
+        Returns
+        -------
+        LOKAN
+            New model on the same device.  The original is unchanged.
+
+        Raises
+        ------
+        RuntimeError
+            If no input data has been cached (forward pass required first).
+
+        Example
+        -------
+        >>> model = LOKAN(width=[2, 5, 1], grid=3, k=3, seed=0)
+        >>> x = torch.rand(200, 2)
+        >>> model(x)
+        >>> model = model.refine(10)
+        >>> print(model.grid)   # 10
+        >>> model = model.refine(50)
+        >>> print(model.grid)   # 50
+        """
+        if self.cache_data is None:
+            raise RuntimeError(
+                "refine() requires a cached forward pass. "
+                "Run model(x) or model.get_act(x) before calling refine()."
+            )
+
+        model_new = LOKAN(
+            width=[list(w) for w in self.width],
+            grid=new_grid,
+            k=self.k,
+            base_fun=self.base_fun_name,
+            symbolic_enabled=self.symbolic_enabled,
+            affine_trainable=self.affine_trainable,
+            grid_eps=self.grid_eps,
+            grid_range=self.grid_range,
+            sp_trainable=self.sp_trainable,
+            sb_trainable=self.sb_trainable,
+            save_act=self.save_act,
+            device=self.device,
+        )
+
+        model_new.initialize_from_another_model(self, self.cache_data)
+        model_new.cache_data = self.cache_data
+        model_new.grid       = new_grid
+        model_new.input_id   = self.input_id
+        return model_new.to(self.device)
+
     # ------------------------------------------------------------------
     # Forward pass
     # ------------------------------------------------------------------
@@ -1472,6 +1599,249 @@ class LOKAN(nn.Module):
             in_vars=in_vars, out_vars=out_vars, title=title,
             varscale=varscale, tau_decode=tau_decode, save_path=save_path,
         )
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+
+    def fit(
+        self,
+        dataset,
+        lr_start=0.1,
+        lr_end=1e-3,
+        batch_size=64,
+        epochs=200,
+        tau_start=2.0,
+        tau_end=0.1,
+        lamb_ent_ops_start=1e-2,
+        lamb_ent_ops_end=1.0,
+        lamb_l1_acts=1e-3,
+        lamb_ent_acts=1e-6,
+        update_grid=True,
+        grid_update_num=10,
+        start_grid_update_epoch=0,
+        stop_grid_update_epoch=None,
+        refine_schedule=None,
+        verbose=10,
+    ):
+        """
+        Train the model in-place and return the loss history.
+
+        Combines adaptive grid update, temperature/lr/lambda annealing, and
+        optional inline grid refinement into a single call.  The model is
+        modified in-place; only the history dict is returned.
+
+        Grid update schedule (matches MultKAN defaults):
+            ``stop_grid_update_epoch`` defaults to ``epochs // 2``.
+            ``update_grid()`` is called ``grid_update_num`` times, evenly
+            spaced in ``[start_grid_update_epoch, stop_grid_update_epoch)``.
+
+        Refine schedule:
+            At the start of each listed epoch the internal spline layers are
+            replaced with a refined version (finer grid).  The optimizer is
+            reset to reflect the new parameter set.
+
+        Parameters
+        ----------
+        dataset : dict
+            Must contain ``'train_input'``, ``'train_label'``,
+            ``'test_input'``, ``'test_label'``.
+        lr_start, lr_end : float
+            Exponential lr schedule endpoints (Adam).
+        batch_size : int
+            Mini-batch size.
+        epochs : int
+            Number of training epochs.
+        tau_start, tau_end : float
+            Softmax temperature schedule for operation logits.
+        lamb_ent_ops_start, lamb_ent_ops_end : float
+            Entropy regularization weight on logits (annealed upward to
+            push the logits toward a discrete assignment).
+        lamb_l1_acts : float
+            L1 regularization weight on spline activation scales.
+        lamb_ent_acts : float
+            Row/column entropy regularization weight on activation scales.
+        update_grid : bool
+            Enable adaptive knot placement.
+        grid_update_num : int
+            Total number of ``update_grid()`` calls within the update window.
+        start_grid_update_epoch : int
+            First epoch at which grid updates are allowed.
+        stop_grid_update_epoch : int or None
+            Last epoch (exclusive) for grid updates.  Defaults to
+            ``epochs // 2``.
+        refine_schedule : list of (int, int) or None
+            E.g. ``[(100, 5), (150, 10)]`` — at epoch 100 refine to G=5,
+            at epoch 150 to G=10.
+        verbose : int
+            Print every ``verbose`` epochs.  0 = silent.
+
+        Returns
+        -------
+        history : dict
+            ``{'train_loss': [...], 'test_loss': [...]}`` — one value per epoch.
+
+        Example
+        -------
+        >>> model = LOKAN(width=[2, 2, 1], grid=3, k=3, seed=0)
+        >>> x = torch.rand(500, 2) * 2 - 1
+        >>> dataset = {
+        ...     'train_input': x, 'train_label': (x[:,0]*x[:,1]).unsqueeze(1),
+        ...     'test_input': x,  'test_label':  (x[:,0]*x[:,1]).unsqueeze(1),
+        ... }
+        >>> history = model.fit(dataset, epochs=100, verbose=25,
+        ...                     refine_schedule=[(60, 5), (80, 10)])
+        >>> model.grid   # 10 after the last refine
+        10
+        """
+        from .LOKANLayer import LOKANLayer
+
+        if stop_grid_update_epoch is None:
+            stop_grid_update_epoch = epochs // 2
+
+        refine_dict = dict(refine_schedule) if refine_schedule else {}
+
+        def _update_epoch_set(seg_start, seg_stop, n):
+            """Epochs within [seg_start, seg_stop) at which update_grid fires."""
+            window = max(seg_stop - seg_start, 1)
+            freq   = max(window // n, 1)
+            return {seg_start + k * freq
+                    for k in range(n)
+                    if seg_start + k * freq < seg_stop}
+
+        if update_grid:
+            if refine_dict:
+                # Per-segment: fire update_grid in the first half of each segment
+                # delimited by refine events, mirroring MultKAN's per-stage logic.
+                boundaries = [0] + sorted(refine_dict) + [epochs]
+                _update_epochs = set()
+                for seg_s, seg_e in zip(boundaries, boundaries[1:]):
+                    half = seg_s + (seg_e - seg_s) // 2
+                    _update_epochs |= _update_epoch_set(seg_s, half, grid_update_num)
+            else:
+                # Original global window behaviour.
+                _update_epochs = _update_epoch_set(
+                    start_grid_update_epoch, stop_grid_update_epoch, grid_update_num
+                )
+        else:
+            _update_epochs = set()
+
+        criterion   = nn.MSELoss()
+        optimizer   = torch.optim.Adam(self.parameters(), lr=lr_start)
+        history     = {'train_loss': [], 'test_loss': []}
+
+        for epoch in range(epochs):
+            t = epoch / max(epochs - 1, 1)
+
+            # Inline grid refinement — swap act_fun layers in-place so that
+            # self remains the same Python object after refinement.
+            if epoch in refine_dict:
+                new_g     = refine_dict[epoch]
+                model_new = LOKAN(
+                    width=[list(w) for w in self.width],
+                    grid=new_g, k=self.k,
+                    base_fun=self.base_fun_name,
+                    symbolic_enabled=self.symbolic_enabled,
+                    affine_trainable=self.affine_trainable,
+                    grid_eps=self.grid_eps,
+                    grid_range=self.grid_range,
+                    sp_trainable=self.sp_trainable,
+                    sb_trainable=self.sb_trainable,
+                    save_act=self.save_act,
+                    device=self.device,
+                )
+                model_new.initialize_from_another_model(self, self.cache_data)
+                # Replace the spline layers; nn.Module.__setattr__ re-registers them.
+                self.act_fun = model_new.act_fun
+                self.grid    = new_g
+                cur_lr    = lr_start * (lr_end / lr_start) ** t
+                optimizer = torch.optim.Adam(self.parameters(), lr=cur_lr)
+                if verbose:
+                    print(f'  [refine] epoch {epoch}: grid → {new_g}')
+
+            # Exponential schedules
+            new_lr   = lr_start           * (lr_end           / lr_start)           ** t
+            new_tau  = tau_start          * (tau_end          / tau_start)          ** t
+            new_lamb = lamb_ent_ops_start * (lamb_ent_ops_end / lamb_ent_ops_start) ** t
+
+            for pg in optimizer.param_groups:
+                pg['lr'] = new_lr
+            for m in self.modules():
+                if isinstance(m, LOKANLayer):
+                    m.tau = new_tau
+
+            # Adaptive grid update (knot positions → data quantiles)
+            if epoch in _update_epochs:
+                with torch.no_grad():
+                    self.update_grid(dataset['train_input'])
+
+            # Mini-batch gradient steps
+            n_train          = dataset['train_input'].shape[0]
+            perm             = torch.randperm(n_train)
+            train_loss_epoch = 0.0
+            n_batches        = 0
+
+            for start in range(0, n_train, batch_size):
+                idx     = perm[start:start + batch_size]
+                batch_x = dataset['train_input'][idx]
+                batch_y = dataset['train_label'][idx]
+
+                outputs    = self(batch_x)
+                train_loss = criterion(outputs, batch_y)
+
+                # Entropy regularization on operation logits
+                ent_ops, n_ops = 0.0, 0
+                for m in self.modules():
+                    if isinstance(m, LOKANLayer):
+                        probs    = torch.softmax(m.logits / m.tau, dim=-1)
+                        ent_ops += (-probs * torch.log(probs + 1e-8)).sum(dim=-1).mean()
+                        n_ops   += 1
+                ent_ops_avg = ent_ops / n_ops if n_ops else 0.0
+
+                # Sparsity regularization on spline activations
+                l1_acts, ent_acts, n_al = 0.0, 0.0, 0
+                for acts in self.acts_scale_spline:
+                    l1_acts += torch.sum(acts)
+                    p_row    = acts / (acts.sum(dim=1, keepdim=True) + 1e-8)
+                    p_col    = acts / (acts.sum(dim=0, keepdim=True) + 1e-8)
+                    ent_acts += (
+                        -torch.mean(torch.sum(p_row * torch.log2(p_row + 1e-8), dim=1))
+                        - torch.mean(torch.sum(p_col * torch.log2(p_col + 1e-8), dim=0))
+                    )
+                    n_al += 1
+                l1_acts  = l1_acts  / n_al if n_al else 0.0
+                ent_acts = ent_acts / n_al if n_al else 0.0
+
+                loss = (train_loss
+                        + new_lamb      * ent_ops_avg
+                        + lamb_l1_acts  * l1_acts
+                        + lamb_ent_acts * ent_acts)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                train_loss_epoch += train_loss.item()
+                n_batches        += 1
+
+            train_loss_epoch /= n_batches
+
+            with torch.no_grad():
+                test_loss = criterion(
+                    self(dataset['test_input']), dataset['test_label']
+                ).item()
+
+            history['train_loss'].append(train_loss_epoch)
+            history['test_loss'].append(test_loss)
+
+            if verbose and (epoch + 1) % verbose == 0:
+                print(
+                    f'Epoch [{epoch+1:4d}/{epochs}]  '
+                    f'train={train_loss_epoch:.6f}  test={test_loss:.6f}  '
+                    f'tau={new_tau:.3f}  λ={new_lamb:.4f}  grid={self.grid}'
+                )
+
+        return history
 
     # ------------------------------------------------------------------
     # Misc

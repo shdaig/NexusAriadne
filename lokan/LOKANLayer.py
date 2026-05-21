@@ -268,6 +268,48 @@ class LOKANLayer(nn.Module):
         self.grid.data = extend_grid(grid, k_extend=self.k)
         self.coef.data = curve2coef(x_pos, y_eval, self.grid, self.k)
 
+    def initialize_grid_from_parent(self, parent, x):
+        """
+        Initialize this layer's grid and spline coefficients from a parent
+        LOKANLayer (typically with a coarser grid), evaluated on input batch *x*.
+
+        The new grid knots are placed at data quantiles of *x* (blended with a
+        uniform grid via ``grid_eps``), and the spline coefficients are refitted
+        so that the represented function matches the parent's output at those
+        points.  The logits and tau are **not** touched here; they are copied
+        by the caller (``initialize_from_another_model``).
+
+        Parameters
+        ----------
+        parent : LOKANLayer
+            Source layer (coarser or different grid).
+        x : torch.Tensor
+            Actual inputs to this layer, shape ``(batch, in_dim)``.
+
+        Example
+        -------
+        >>> coarse = LOKANLayer(in_dim=2, out_dim=2, num=3, k=3)
+        >>> fine   = LOKANLayer(in_dim=2, out_dim=2, num=10, k=3)
+        >>> x = torch.linspace(-1, 1, 200)[:, None].expand(-1, 2)
+        >>> fine.initialize_grid_from_parent(coarse, x)
+        """
+        x_pos    = torch.sort(x, dim=0)[0]                                      # (batch, in_dim)
+        y_eval   = coef2curve(x_pos, parent.grid, parent.coef, parent.k)        # (batch, in_dim, out_dim)
+        num_interval = self.grid.shape[1] - 1 - 2 * self.k                      # G of self (new model)
+
+        batch = x_pos.shape[0]
+
+        def get_grid(n):
+            ids      = [int(batch / n * i) for i in range(n)] + [-1]
+            g_adapt  = x_pos[ids, :].permute(1, 0)                              # (in_dim, n+1)
+            h        = (g_adapt[:, [-1]] - g_adapt[:, [0]]) / n
+            g_uniform = g_adapt[:, [0]] + h * torch.arange(n + 1)[None, :].to(x.device)
+            return self.grid_eps * g_uniform + (1 - self.grid_eps) * g_adapt
+
+        grid = get_grid(num_interval)
+        self.grid.data = extend_grid(grid, k_extend=self.k)
+        self.coef.data = curve2coef(x_pos, y_eval, self.grid, self.k)
+
     def get_subset(self, in_indices, out_indices):
         """
         Return a new LOKANLayer containing only the selected input/output neurons.
