@@ -165,14 +165,14 @@ def run_lokan(dataset, n_in, seed=0, smoke=False):
 
     model.fit(
         dataset=dataset,
-        lr_start=0.1, lr_end=1e-3,
+        lr_start=0.2, lr_end=1e-3,
         batch_size=64,
         epochs=epochs,
         tau_start=2.0, tau_end=0.1,
         lamb_ent_ops_start=1e-2, lamb_ent_ops_end=1.0,
         lamb_l1_acts=1e-3, lamb_ent_acts=1e-6,
-        # update_grid=True,
-        update_grid=False, 
+        update_grid=True,
+        # update_grid=False, 
         grid_update_num=10,
         start_grid_update_epoch=0, stop_grid_update_epoch=None,
         refine_schedule=refine_schedule,
@@ -316,6 +316,7 @@ def main():
 
         try:
             _, expr, _, _ = get_feynman_dataset(eq_id)
+            print("eq_id ---------------------", eq_id)
         except Exception as e:
             print(f'  SKIP: {e}')
             continue
