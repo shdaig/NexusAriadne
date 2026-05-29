@@ -54,6 +54,24 @@ LO, HI = 0.1, 1.0
 H_KAN  = 4
 H_FC   = 8
 
+# Formulas displayed as graph titles instead of raw tags
+_TAG_FORMULAS = {
+    # SR staged regression
+    'sr_stage1': r'$x_0 / x_1$',
+    'sr_stage2': r'$x_0/x_1 + x_2/x_3$',
+    'sr_stage3': r'$x_0 \cdot x_1 + x_2 \cdot x_3$',
+    'sr_stage4': r'$(x_0/x_1 + x_2/x_3)\,/\,(x_4/x_5 + x_6/x_7)$',
+    # Classification (threshold decision boundary shown)
+    'clf_T1':    r'$x_0/x_1 + x_2/x_3 > 2.2$',
+    'clf_T2':    r'$(x_0+x_1)(x_2+x_3) > 0.49$',
+    'clf_T3':    r'$x_0 x_1 x_2 + x_3 x_4 x_5 > 0.18$',
+    # KAN+FC nonlinear regression
+    'kanfc_T1':  r'$1/x_0 + 1/x_1$',
+    'kanfc_T2':  r'$\sin(2\pi x_0)\cdot\sin(2\pi x_1)$',
+    'kanfc_T3':  r'$e^{x_0} + 1\,/\,(0.5 + x_1)$',
+    'kanfc_T4':  r'$\sin(2\pi x_0) + 1\,/\,(0.5+x_1) + x_2^2$',
+}
+
 
 # ---------------------------------------------------------------------------
 # Data generators — produce a small probe batch for activating save_act
@@ -128,9 +146,9 @@ def _build_kanfc_fc(config):
     width = config.get('lokan_width', config.get('width'))
     h_in  = int(width[-1]) if not isinstance(width[-1], list) else int(width[-1][0])
     return nn.Sequential(
-        nn.Linear(h_in,      h_fc),
+        nn.Linear(h_in, h_fc),
         nn.SiLU(),
-        nn.Linear(h_fc,      h_fc // 2),
+        nn.Linear(h_fc, h_fc // 2),
         nn.SiLU(),
         nn.Linear(h_fc // 2, 1),
     ).to(device)
@@ -227,13 +245,15 @@ def visualize_one(pt_path, figures_dir):
     prefix = os.path.join(figures_dir, tag)
     os.makedirs(figures_dir, exist_ok=True)
 
+    formula = _TAG_FORMULAS.get(tag, tag)
+
     # 1. Network diagram
     try:
         plot_nexus_network(
             lokan,
             fc_module  = fc,
             in_vars    = ivars,
-            title      = tag,
+            title      = formula,
             tau_decode = 0.05,
             save_path  = f'{prefix}_network.png',
         )

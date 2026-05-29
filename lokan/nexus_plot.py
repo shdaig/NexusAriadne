@@ -31,8 +31,46 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import torch
+import torch.nn as nn
 
 from .spline import coef2curve
+
+_FC_ACTIVATIONS = {
+    nn.ReLU:       'ReLU',
+    nn.Sigmoid:    'σ',
+    nn.Tanh:       'tanh',
+    nn.GELU:       'GELU',
+    nn.SiLU:       'SiLU',
+    nn.LeakyReLU:  'LeakyReLU',
+    nn.ELU:        'ELU',
+    nn.Softmax:    'Softmax',
+    nn.LogSoftmax: 'log-Softmax',
+    nn.Hardswish:  'Hardswish',
+    nn.Mish:       'Mish',
+}
+
+
+def _fc_activation_names(fc_module):
+    """
+    For each nn.Linear in fc_module.children() (in order), return the name
+    of the activation function that immediately follows it, or None.
+    """
+    children = list(fc_module.children())
+    result = []
+    for idx, m in enumerate(children):
+        if isinstance(m, nn.Linear):
+            act = None
+            for m2 in children[idx + 1:]:
+                if isinstance(m2, nn.Linear):
+                    break
+                for cls, name in _FC_ACTIVATIONS.items():
+                    if isinstance(m2, cls):
+                        act = name
+                        break
+                if act:
+                    break
+            result.append(act)
+    return result
 
 # ---------------------------------------------------------------------------
 # Operation color palette
@@ -129,7 +167,6 @@ def plot_nexus_network(
     """
     import sympy
     from sympy.printing import latex
-    import torch.nn as nn
 
     if not model.save_act:
         print('plot_nexus_network: save_act=False — run model(x) with save_act=True first.')
@@ -162,6 +199,7 @@ def plot_nexus_network(
         [m for m in fc_module.modules() if isinstance(m, nn.Linear)]
         if fc_module is not None else []
     )
+    fc_act_names = _fc_activation_names(fc_module) if fc_module is not None else []
     n_fc = len(fc_linears)
 
     def score2alpha(s):
@@ -379,10 +417,14 @@ def plot_nexus_network(
                 s=fc_node_sz, color='black', zorder=3,
             )
 
-        # Layer label (right margin)
+        # Layer label (right margin) — include activation if known
+        act_lbl  = fc_act_names[l_fc] if l_fc < len(fc_act_names) else None
+        fc_label = f'FC {l_fc}\n({n_in}→{n_out})'
+        if act_lbl:
+            fc_label += f'\n{act_lbl}'
         ax.text(
             1.03, (y_in + y_out) / 2,
-            f'FC {l_fc}\n({n_in}→{n_out})',
+            fc_label,
             fontsize=fs_fc_lbl, ha='left', va='center', color='#444',
             transform=ax.transData,
         )
@@ -405,14 +447,15 @@ def plot_nexus_network(
                          fontsize=40 * scale * varscale,
                          ha='center', va='center')
 
+    y_top_net = total_depth * (y0 + z0)
+
     if out_vars is not None:
         # Place labels above the topmost layer (FC top if present, else KAN top)
         if fc_linears:
             n_top = fc_linears[-1].out_features
-            y_top = total_depth * (y0 + z0) + 0.15
         else:
             n_top = model.width_in[-1]
-            y_top = (y0 + z0) * (neuron_depth - 1) + 0.15
+        y_top = y_top_net + 0.15
         for i, var in enumerate(out_vars):
             try:
                 import sympy as sp
@@ -427,7 +470,7 @@ def plot_nexus_network(
                          ha='center', va='center')
 
     if title is not None:
-        y_t = total_depth * (y0 + z0) + 0.3
+        y_t = y_top_net + 0.3
         main_ax.text(0.5, y_t, title,
                      fontsize=40 * scale, ha='center', va='center')
 
@@ -678,11 +721,10 @@ def plot_kan_fc_architecture(
     -------
     matplotlib.figure.Figure
     """
-    import torch.nn as nn
-
-    device     = next(kan_model.parameters()).device
-    kan_layers = list(kan_model.act_fun)
-    fc_linears = [m for m in fc_module.modules() if isinstance(m, nn.Linear)]
+    device      = next(kan_model.parameters()).device
+    kan_layers  = list(kan_model.act_fun)
+    fc_linears  = [m for m in fc_module.modules() if isinstance(m, nn.Linear)]
+    fc_act_names = _fc_activation_names(fc_module)
 
     n_kan = len(kan_layers)
     n_fc  = len(fc_linears)
@@ -869,7 +911,11 @@ def plot_kan_fc_architecture(
         ax.set_yticklabels(y_labels, fontsize=fs_fc * scale)
         ax.set_xlabel('Input', fontsize=7 * scale)
         ax.set_ylabel('Output', fontsize=7 * scale)
-        ax.set_title(f'FC Layer {f}  ({n_in}→{n_out})', fontsize=9 * scale, pad=4)
+        act_lbl  = fc_act_names[f] if f < len(fc_act_names) else None
+        fc_title = f'FC Layer {f}  ({n_in}→{n_out})'
+        if act_lbl:
+            fc_title += f'  [{act_lbl}]'
+        ax.set_title(fc_title, fontsize=9 * scale, pad=4)
 
     if title:
         fig.suptitle(title, fontsize=12 * scale)

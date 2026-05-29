@@ -273,7 +273,7 @@ def save_model(lokan_model, stage_idx, seed, n_in):
     meta    = {
         'tag':      tag,
         'n_in':     n_in,
-        'width':    [n_in, n_in, 1],
+        'width':    [n_in, n_in + 2, 1],
         'grid':     lokan_model.grid,
         'k':        lokan_model.k,
         'seed':     seed,
